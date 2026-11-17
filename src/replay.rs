@@ -458,9 +458,14 @@ mod tests {
         assert!(cache.check_and_insert_at(&key(5), end));
     }
 
-    /// Capacity-driven rollover: far more keys than fit. The cache stays
-    /// bounded, counts the early rotations, and still never admits a key twice
-    /// in a row.
+    /// Capacity-driven rollover with eight threads and far more keys than fit.
+    /// The cache stays bounded, counts the early rotations and never rejects a
+    /// key it has not seen.
+    ///
+    /// A replay sent right after the original is not asserted here: with the
+    /// cache this overloaded, other threads can push a key out of both
+    /// generations while its thread is descheduled. That recency bound is
+    /// checked deterministically in `early_rollover_keeps_the_most_recent_keys`.
     #[test]
     fn early_rollover_under_load() {
         const THREADS: u32 = 8;
@@ -473,23 +478,33 @@ mod tests {
             .map(|thread| {
                 let cache = cache.clone();
                 std::thread::spawn(move || {
-                    let mut wrong = 0u32;
+                    let mut fresh_rejected = 0u32;
+                    let mut replays_caught = 0u32;
                     for i in 0..KEYS {
                         let k = key((thread << 24) | i);
                         if !cache.check_and_insert(&k) {
-                            wrong += 1;
+                            fresh_rejected += 1;
                         }
-                        if cache.check_and_insert(&k) {
-                            wrong += 1;
+                        if !cache.check_and_insert(&k) {
+                            replays_caught += 1;
                         }
                     }
-                    wrong
+                    (fresh_rejected, replays_caught)
                 })
             })
             .collect();
-        let wrong: u32 = handles.into_iter().map(|h| h.join().unwrap()).sum();
+        let (fresh_rejected, replays_caught) = handles
+            .into_iter()
+            .map(|h| h.join().unwrap())
+            .fold((0, 0), |a, b| (a.0 + b.0, a.1 + b.1));
 
-        assert_eq!(wrong, 0);
+        assert_eq!(fresh_rejected, 0);
+        // Missing an immediate replay takes two rotations of a shard between
+        // two consecutive calls of one thread, so it is rare even here.
+        assert!(
+            replays_caught >= THREADS * KEYS * 99 / 100,
+            "{replays_caught}"
+        );
         assert!(cache.early_rotations() >= u64::from(THREADS * KEYS / 16_384) - 4);
         assert_eq!(cache.memory_bytes(), memory);
         for shard in cache.shards.iter() {
@@ -497,5 +512,29 @@ mod tests {
             assert!(shard.current.len <= cache.shard_capacity);
             assert!(shard.previous.len <= cache.shard_capacity);
         }
+    }
+
+    /// When shards rotate early, each still remembers at least its last
+    /// `shard_capacity` keys, so the most recent keys overall are always known.
+    #[test]
+    fn early_rollover_keeps_the_most_recent_keys() {
+        const KEYS: u32 = 200_000;
+        let cache = ReplayCache::new(WINDOW, 16_384);
+        let per_shard = cache.shard_capacity as u32;
+        for n in 0..KEYS {
+            assert!(cache.check_and_insert(&key(n)));
+            assert!(!cache.check_and_insert(&key(n)), "immediate replay of {n}");
+        }
+        assert!(cache.early_rotations() > 20);
+        // The last `per_shard` keys overall are within the last `per_shard`
+        // keys of whichever shard they landed in.
+        for n in KEYS - per_shard..KEYS {
+            assert!(!cache.check_and_insert(&key(n)), "forgot recent key {n}");
+        }
+        // Keys from the start are long gone.
+        let forgotten = (0..1000)
+            .filter(|n| cache.check_and_insert(&key(*n)))
+            .count();
+        assert_eq!(forgotten, 1000);
     }
 }
