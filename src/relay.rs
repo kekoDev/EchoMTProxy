@@ -1,4 +1,6 @@
 use std::io;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
@@ -6,6 +8,8 @@ use crate::cipher::{AesCtr, Ctr};
 use crate::tls::{record_header, RecordReader, MAX_RECORD_PAYLOAD, RECORD_HEADER_LEN};
 
 const BUF_LEN: usize = 16 * 1024;
+/// The idle watcher wakes this many times per idle period.
+const IDLE_CHECKS: u32 = 4;
 
 /// Per-direction ciphers. `None` means that step is skipped for the upstream mode.
 pub struct Ciphers {
@@ -25,6 +29,7 @@ async fn client_to_upstream<R, W>(
     mut records: RecordReader,
     mut dec: AesCtr,
     mut enc: Option<AesCtr>,
+    activity: &AtomicU64,
 ) -> io::Result<()>
 where
     R: AsyncRead + Unpin,
@@ -36,6 +41,7 @@ where
         if n == 0 {
             return Ok(());
         }
+        activity.fetch_add(1, Ordering::Relaxed);
         let len = records
             .unwrap_in_place(&mut buf, n)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
@@ -56,6 +62,7 @@ async fn upstream_to_client<R, W>(
     mut client: W,
     mut dec: Option<AesCtr>,
     mut enc: Option<AesCtr>,
+    activity: &AtomicU64,
 ) -> io::Result<()>
 where
     R: AsyncRead + Unpin,
@@ -69,6 +76,7 @@ where
         if n == 0 {
             return Ok(());
         }
+        activity.fetch_add(1, Ordering::Relaxed);
         let payload = &mut buf[RECORD_HEADER_LEN..RECORD_HEADER_LEN + n];
         if let Some(dec) = dec.as_mut() {
             dec.apply(payload);
@@ -81,8 +89,33 @@ where
     }
 }
 
-/// Relays until either side closes or fails. `records` carries the framing
-/// state left over from the handshake.
+/// Resolves once neither direction has read anything for `idle`.
+///
+/// Instead of re-arming a timer on every packet, the relay bumps a counter and
+/// this wakes a few times per idle period to see whether it moved. The session
+/// is therefore dropped between `idle` and `idle * 5/4` after its last byte.
+async fn idle_watch(activity: &AtomicU64, idle: Option<Duration>) {
+    let Some(idle) = idle else {
+        return std::future::pending().await;
+    };
+    let tick = (idle / IDLE_CHECKS).max(Duration::from_millis(1));
+    let mut last = activity.load(Ordering::Relaxed);
+    let mut quiet = 0;
+    while quiet < IDLE_CHECKS {
+        tokio::time::sleep(tick).await;
+        let now = activity.load(Ordering::Relaxed);
+        if now == last {
+            quiet += 1;
+        } else {
+            quiet = 0;
+            last = now;
+        }
+    }
+}
+
+/// Relays until either side closes or fails, or until both directions have
+/// been silent for `idle` (`None` disables that). `records` carries the
+/// framing state left over from the handshake.
 pub async fn relay<CR, CW, UR, UW>(
     client_read: CR,
     client_write: CW,
@@ -90,6 +123,7 @@ pub async fn relay<CR, CW, UR, UW>(
     upstream_write: UW,
     records: RecordReader,
     ciphers: Ciphers,
+    idle: Option<Duration>,
 ) -> io::Result<()>
 where
     CR: AsyncRead + Unpin,
@@ -97,6 +131,7 @@ where
     UR: AsyncRead + Unpin,
     UW: AsyncWrite + Unpin,
 {
+    let activity = AtomicU64::new(0);
     tokio::select! {
         result = client_to_upstream(
             client_read,
@@ -104,13 +139,18 @@ where
             records,
             ciphers.client_dec,
             ciphers.upstream_enc,
+            &activity,
         ) => result,
         result = upstream_to_client(
             upstream_read,
             client_write,
             ciphers.upstream_dec,
             ciphers.client_enc,
+            &activity,
         ) => result,
+        () = idle_watch(&activity, idle) => {
+            Err(io::Error::new(io::ErrorKind::TimedOut, "session idle"))
+        }
     }
 }
 
@@ -144,6 +184,7 @@ mod tests {
             pu_write,
             RecordReader::new(),
             ciphers,
+            None,
         ));
 
         let (mut client_read, mut client_write) = tokio::io::split(client);
@@ -278,6 +319,7 @@ mod tests {
                 upstream_dec: None,
                 client_enc: None,
             },
+            None,
         )
         .await;
         assert_eq!(result.unwrap_err().kind(), io::ErrorKind::InvalidData);
@@ -308,11 +350,107 @@ mod tests {
                     upstream_dec: None,
                     client_enc: None,
                 },
+                None,
             )
             .await;
             assert!(result.is_ok());
             drop(keep);
         }
+    }
+
+    fn idle_ciphers() -> Ciphers {
+        Ciphers {
+            client_dec: cipher(1),
+            upstream_enc: None,
+            upstream_dec: None,
+            client_enc: None,
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn idle_session_is_closed_within_the_documented_bound() {
+        const IDLE: Duration = Duration::from_secs(900);
+        let (_client, proxy_client) = tokio::io::duplex(1024);
+        let (_upstream, proxy_upstream) = tokio::io::duplex(1024);
+        let (pc_read, pc_write) = tokio::io::split(proxy_client);
+        let (pu_read, pu_write) = tokio::io::split(proxy_upstream);
+        let start = tokio::time::Instant::now();
+        let result = relay(
+            pc_read,
+            pc_write,
+            pu_read,
+            pu_write,
+            RecordReader::new(),
+            idle_ciphers(),
+            Some(IDLE),
+        )
+        .await;
+        assert_eq!(result.unwrap_err().kind(), io::ErrorKind::TimedOut);
+        let elapsed = start.elapsed();
+        assert!(elapsed >= IDLE && elapsed <= IDLE * 5 / 4, "{elapsed:?}");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn traffic_in_either_direction_keeps_the_session_open() {
+        const IDLE: Duration = Duration::from_secs(900);
+        for from_client in [true, false] {
+            let (mut client, proxy_client) = tokio::io::duplex(1024);
+            let (mut upstream, proxy_upstream) = tokio::io::duplex(1024);
+            let (pc_read, pc_write) = tokio::io::split(proxy_client);
+            let (pu_read, pu_write) = tokio::io::split(proxy_upstream);
+            let start = tokio::time::Instant::now();
+            let task = tokio::spawn(relay(
+                pc_read,
+                pc_write,
+                pu_read,
+                pu_write,
+                RecordReader::new(),
+                idle_ciphers(),
+                Some(IDLE),
+            ));
+
+            // One direction stays silent for 10 idle periods while the other
+            // sends a byte every 800 s.
+            let mut sink = [0u8; 16];
+            for _ in 0..12 {
+                tokio::time::sleep(Duration::from_secs(800)).await;
+                assert!(!task.is_finished(), "closed while active");
+                if from_client {
+                    let mut framed = Vec::new();
+                    wrap_records(b"x", &mut framed);
+                    client.write_all(&framed).await.unwrap();
+                    upstream.read_exact(&mut sink[..1]).await.unwrap();
+                } else {
+                    upstream.write_all(b"x").await.unwrap();
+                    client.read_exact(&mut sink[..6]).await.unwrap();
+                }
+            }
+            let last_byte = tokio::time::Instant::now();
+            let result = task.await.unwrap();
+            assert_eq!(result.unwrap_err().kind(), io::ErrorKind::TimedOut);
+            let quiet = last_byte.elapsed();
+            assert!(quiet >= IDLE && quiet <= IDLE * 5 / 4, "{quiet:?}");
+            assert!(start.elapsed() > IDLE * 10);
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn no_idle_timeout_when_disabled() {
+        let (_client, proxy_client) = tokio::io::duplex(1024);
+        let (_upstream, proxy_upstream) = tokio::io::duplex(1024);
+        let (pc_read, pc_write) = tokio::io::split(proxy_client);
+        let (pu_read, pu_write) = tokio::io::split(proxy_upstream);
+        let task = tokio::spawn(relay(
+            pc_read,
+            pc_write,
+            pu_read,
+            pu_write,
+            RecordReader::new(),
+            idle_ciphers(),
+            None,
+        ));
+        tokio::time::sleep(Duration::from_secs(365 * 86_400)).await;
+        assert!(!task.is_finished());
     }
 
     proptest! {

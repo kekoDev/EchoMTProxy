@@ -31,6 +31,8 @@ pub struct Proxy {
     dc: DcTable,
     upstream_mode: UpstreamMode,
     handshake_timeout: Duration,
+    /// `None` when `idle_timeout_secs` is 0.
+    idle_timeout: Option<Duration>,
     masker: Masker,
     stats: Arc<Stats>,
 }
@@ -72,6 +74,8 @@ impl Proxy {
             dc,
             upstream_mode: config.upstream_mode,
             handshake_timeout: Duration::from_secs(config.handshake_timeout_secs),
+            idle_timeout: (config.idle_timeout_secs > 0)
+                .then(|| Duration::from_secs(config.idle_timeout_secs)),
             masker,
             stats: Arc::new(stats),
         })
@@ -275,6 +279,7 @@ async fn run_session(client: TcpStream, session: Session, proxy: &Proxy) -> io::
             upstream_dec,
             client_enc,
         },
+        proxy.idle_timeout,
     )
     .await
 }

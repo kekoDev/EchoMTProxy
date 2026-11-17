@@ -1017,3 +1017,34 @@ async fn metrics_report_usage_and_failures_per_sni() {
     assert!(!response.contains("unlisted.example"));
     drop((open, unlisted));
 }
+
+#[tokio::test]
+async fn idle_session_is_closed_and_active_one_is_kept() {
+    let dc = spawn_echo_dc(true).await;
+    let proxy = spawn_proxy_with("fast", dc, "idle_timeout_secs = 1").await;
+
+    // Traffic every 300 ms for 2.4 s: well past the timeout, never idle.
+    let mut active = Client::connect(proxy, DC).await;
+    let mut idle = Client::connect(proxy, DC).await;
+    assert_eq!(idle.echo(b"once").await, b"once");
+    let idle_since = std::time::Instant::now();
+    for _ in 0..8 {
+        assert_eq!(active.echo(b"keepalive").await, b"keepalive");
+        tokio::time::sleep(Duration::from_millis(300)).await;
+    }
+
+    let mut buf = [0u8; 8];
+    let read = timeout(STEP, idle.read.read(&mut buf)).await.unwrap();
+    assert!(matches!(read, Ok(0) | Err(_)), "idle session still open");
+    assert!(idle_since.elapsed() >= Duration::from_secs(1));
+
+    // The active session ends once it goes quiet too.
+    let quiet_since = std::time::Instant::now();
+    let read = timeout(STEP, active.read.read(&mut buf)).await.unwrap();
+    assert!(matches!(read, Ok(0) | Err(_)));
+    let quiet = quiet_since.elapsed();
+    assert!(
+        quiet >= Duration::from_millis(600) && quiet < Duration::from_secs(3),
+        "{quiet:?}"
+    );
+}
