@@ -1,0 +1,38 @@
+[package]
+name = "echo-mtproxy"
+version = "0.1.0"
+edition = "2021"
+authors = ["telegramvpn.org"]
+description = "High-performance Fake-TLS MTProto proxy for Telegram"
+license = "Apache-2.0"
+repository = "https://github.com/kekoDev/EchoMTProxy"
+readme = "README.md"
+publish = false
+
+[dependencies]
+aes = "0.8"
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+ctr = "0.9"
+hex = "0.4"
+hmac = "0.12"
+rand = "0.8"
+serde = { version = "1", features = ["derive"] }
+sha2 = "0.10"
+socket2 = "0.5"
+thiserror = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "time", "macros", "signal"] }
+toml = "0.8"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[dev-dependencies]
+proptest = "1"
+serde_json = "1"
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = true

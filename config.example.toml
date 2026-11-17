@@ -1,0 +1,42 @@
+# Copy to config.toml and edit. config.toml is gitignored; never commit real secrets.
+
+listen = ["0.0.0.0:443", "[::]:443"]
+workers = 0                      # 0 = number of CPUs
+
+# Fake-TLS secrets: "ee" + 32 hex chars (16-byte key) + hex of the domain.
+# Generate one with: echo-mtproxy --gen-secret www.example.com
+# The value below is an example (zero key, www.example.com). Replace it.
+secrets = ["ee000000000000000000000000000000007777772e6578616d706c652e636f6d"]
+
+mask_host = ""                   # empty = domain from secret
+prefer_ipv6_upstream = true
+
+# AES passes per byte (client->DC / DC->client):
+#   fast        2 / 0   obfuscated upstream reusing the client's key for the DC->client leg
+#   obfuscated  2 / 2   obfuscated upstream with independent keys
+#   plain       1 / 1   experimental: unobfuscated upstream, not yet verified against real DCs
+upstream_mode = "fast"
+
+# Accepted client clock error. A ClientHello is valid for behind + ahead seconds.
+time_skew_behind_secs = 600      # client clock may lag the proxy by this much
+time_skew_ahead_secs = 1200      # client clock may lead the proxy by this much
+# Some clients send uptime instead of Unix time. Accepting those timestamps means
+# such a handshake can be replayed once it has aged out of the replay cache.
+accept_uptime_timestamps = true
+
+# Replay cache size per generation. Two generations are kept so every entry lives
+# for at least behind + ahead seconds. Each handshake stores 2 entries of 32 bytes;
+# memory is allocated as the table grows, 38-75 bytes per live entry, so the
+# worst case for the default is about 280 MB. If a generation fills up before the
+# window elapses, the oldest generation is dropped early and a warning is logged.
+replay_cache_entries = 2000000
+
+handshake_timeout_secs = 10
+idle_timeout_secs = 900
+max_connections = 2000000
+metrics_listen = "127.0.0.1:9100"
+cipher_backend = "rustcrypto"    # rustcrypto | openssl (openssl is not built yet)
+
+# Optional per-DC upstream address override (DC ids 1-5).
+# [dc_override]
+# 5 = "91.108.56.100:443"
