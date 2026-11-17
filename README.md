@@ -109,8 +109,6 @@ clients cannot create new series.
 
 - `pin_workers` pins each worker thread to one CPU. Off by default and
   unmeasured; try it together with per-CPU packet steering.
-- `reuse_port` opens one `SO_REUSEPORT` listener per worker. Off by default
-  and undecided: no benefit showed up on loopback.
 - The binary uses mimalloc as its allocator (the default `mimalloc` feature).
   On the target server it measured 4.1 KiB of resident memory per idle session
   against 4.6 KiB with glibc malloc, and 6% more handshakes per second. Build
@@ -171,7 +169,7 @@ cargo test --release --test storm -- --ignored --nocapture # accept and handshak
 
 The storm test drives the real binary and prints accepted connections per
 second and full handshakes per second. Use it to compare builds and settings,
-for example `--features mimalloc` or `STORM_EXTRA_CONFIG='reuse_port = true'`.
+for example `--no-default-features` or `STORM_EXTRA_CONFIG='pin_workers = true'`.
 
 The soak test opens 10 000 concurrent sessions and needs about 40 500 file
 descriptors; it raises its own soft limit and says so if the hard limit is too

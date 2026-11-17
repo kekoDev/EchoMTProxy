@@ -13,7 +13,7 @@
 //! Environment: `STORM_SECS` per round (5), `STORM_ROUNDS` (3),
 //! `STORM_CLIENTS` concurrent client tasks (64), `STORM_PROXY_WORKERS` (4),
 //! `STORM_HARNESS_THREADS` threads for the clients and fake DCs (4),
-//! `STORM_EXTRA_CONFIG` extra config lines, e.g. `reuse_port = true`.
+//! `STORM_EXTRA_CONFIG` extra config lines, e.g. `pin_workers = true`.
 #![cfg(unix)]
 
 mod common;

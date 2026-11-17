@@ -217,8 +217,6 @@ pub struct Config {
     pub workers: usize,
     /// Pin each worker thread to one CPU.
     pub pin_workers: bool,
-    /// Open one SO_REUSEPORT listening socket per worker for each address.
-    pub reuse_port: bool,
     pub secrets: Vec<String>,
     /// Default mask target, `host` or `host:port`. Empty means the domain of
     /// the first secret.
@@ -254,7 +252,6 @@ impl Default for Config {
             ],
             workers: 0,
             pin_workers: false,
-            reuse_port: false,
             secrets: Vec::new(),
             mask_host: String::new(),
             mask_domains: Vec::new(),
@@ -525,7 +522,6 @@ mod tests {
         assert!(config.prefer_ipv6_upstream);
         assert!(config.dc_override.is_empty());
         assert!(!config.pin_workers);
-        assert!(!config.reuse_port);
         assert_eq!(config.mask_idle_timeout_secs, 120);
         assert_eq!(config.mask_dns_ttl_secs, 300);
     }

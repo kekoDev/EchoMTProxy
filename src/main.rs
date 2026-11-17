@@ -99,14 +99,8 @@ fn print_existing(args: &Args) -> anyhow::Result<()> {
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
-fn bind(addr: SocketAddr, reuse_port: bool) -> std::io::Result<std::net::TcpListener> {
+fn bind(addr: SocketAddr) -> std::io::Result<std::net::TcpListener> {
     let socket = Socket::new(Domain::for_address(addr), Type::STREAM, Some(Protocol::TCP))?;
-    if reuse_port {
-        // Several sockets on one address: the kernel spreads new connections
-        // over them, each with its own accept queue.
-        #[cfg(unix)]
-        socket.set_reuse_port(true)?;
-    }
     if addr.is_ipv6() {
         // Otherwise [::]:443 also claims IPv4 and 0.0.0.0:443 fails to bind.
         socket.set_only_v6(true)?;
@@ -201,16 +195,14 @@ fn main() -> anyhow::Result<()> {
     let runtime = runtime.build().context("starting the tokio runtime")?;
 
     runtime.block_on(async {
-        let sockets_per_address = if config.reuse_port { workers } else { 1 };
+        // One listener per address. Per-worker SO_REUSEPORT listeners were
+        // measured on the target server and did not raise the accept rate.
         for addr in &config.listen {
-            for _ in 0..sockets_per_address {
-                let listener =
-                    bind(*addr, config.reuse_port).with_context(|| format!("binding {addr}"))?;
-                let listener = tokio::net::TcpListener::from_std(listener)
-                    .with_context(|| format!("registering {addr}"))?;
-                tokio::spawn(server::serve(listener, proxy.clone()));
-            }
-            tracing::info!(%addr, sockets = sockets_per_address, "listening");
+            let listener = bind(*addr).with_context(|| format!("binding {addr}"))?;
+            let listener = tokio::net::TcpListener::from_std(listener)
+                .with_context(|| format!("registering {addr}"))?;
+            tracing::info!(%addr, "listening");
+            tokio::spawn(server::serve(listener, proxy.clone()));
         }
         if let Some(addr) = config.metrics_addr() {
             let listener = tokio::net::TcpListener::bind(addr)
