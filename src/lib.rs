@@ -3,6 +3,7 @@ pub mod config;
 pub mod dc;
 pub mod mask;
 pub mod obfs2;
+pub mod pool;
 pub mod relay;
 pub mod replay;
 pub mod server;

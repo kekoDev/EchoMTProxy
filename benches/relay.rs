@@ -15,8 +15,8 @@ use tokio::net::{TcpListener, TcpStream};
 
 const CHUNK: usize = 1 << 20;
 
-fn cipher(seed: u8) -> AesCtr {
-    AesCtr::new(&[seed; 32], &[seed.wrapping_add(1); 16])
+fn cipher(seed: u8) -> Box<AesCtr> {
+    Box::new(AesCtr::new(&[seed; 32], &[seed.wrapping_add(1); 16]))
 }
 
 fn ciphers(mode: &str) -> Ciphers {
@@ -56,17 +56,17 @@ async fn socket_pair() -> (TcpStream, TcpStream) {
 fn start(runtime: &tokio::runtime::Runtime, mode: &str) -> (TcpStream, TcpStream) {
     let ((client, proxy_client), (upstream, proxy_upstream)) =
         runtime.block_on(async { (socket_pair().await, socket_pair().await) });
-    let (client_read, client_write) = proxy_client.into_split();
-    let (upstream_read, upstream_write) = proxy_upstream.into_split();
-    runtime.spawn(relay(
-        client_read,
-        client_write,
-        upstream_read,
-        upstream_write,
-        RecordReader::new(),
-        ciphers(mode),
-        Some(Duration::from_secs(900)),
-    ));
+    let ciphers = ciphers(mode);
+    runtime.spawn(async move {
+        relay(
+            &proxy_client,
+            &proxy_upstream,
+            RecordReader::new(),
+            ciphers,
+            Some(Duration::from_secs(900)),
+        )
+        .await
+    });
     (client, upstream)
 }
 

@@ -154,6 +154,14 @@ async fn concurrent_sessions_soak() {
     );
     assert_eq!(rejected(&stats, label) + rejected(&stats, other), 0);
     assert_eq!(stats.connections_over_limit(), 0);
+    // Every session has carried traffic and is now idle: none may still hold
+    // a relay buffer. (Briefly non-zero while the last echoes drain.)
+    wait_for("idle sessions to return their buffers", deadline, || {
+        echo_mtproxy::pool::in_use() == 0
+    })
+    .await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(echo_mtproxy::pool::in_use(), 0);
 
     release.send(true).unwrap();
     // Sessions finish their second echo, then wait for the DC to hang up.

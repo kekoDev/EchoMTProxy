@@ -43,14 +43,12 @@ const PROXY_ADDRS: [[u8; 4]; 4] = [
 ];
 const DC_COUNT: usize = 5;
 
-/// Ceiling for resident bytes per idle session: a regression guard, not a goal.
+/// Ceiling for resident bytes per idle session.
 ///
-/// Measured at 54 KiB with glibc (release build, 1 000 -> 50 000 sessions).
-/// A session owns two 16 KiB relay buffers for its whole life; the rest is the
-/// connection task, its cipher states and allocator overhead. The phase 3
-/// buffer pool is meant to bring the figure under 1 KiB; lower this constant
-/// when it lands.
-const BUDGET_BYTES_PER_IDLE_SESSION: u64 = 64 * 1024;
+/// Measured at 4.4 KiB with glibc (release build, 1 000 -> 50 000 sessions,
+/// fast mode): two 1 KiB cipher states, a 1.4 KiB task, two socket
+/// registrations and allocator overhead. Idle sessions hold no relay buffer.
+const BUDGET_BYTES_PER_IDLE_SESSION: u64 = 8 * 1024;
 
 struct ProxyProcess(Child);
 

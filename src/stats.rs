@@ -276,6 +276,14 @@ impl Stats {
     fn render_into(&self, out: &mut String) -> std::fmt::Result {
         writeln!(
             out,
+            "# HELP echo_mtproxy_pool_buffers_in_use Relay buffers borrowed right now; \
+             idle sessions hold none.\n\
+             # TYPE echo_mtproxy_pool_buffers_in_use gauge\n\
+             echo_mtproxy_pool_buffers_in_use {}",
+            crate::pool::in_use()
+        )?;
+        writeln!(
+            out,
             "# HELP echo_mtproxy_connections_open Client connections currently open, \
              including handshaking and masked ones.\n\
              # TYPE echo_mtproxy_connections_open gauge\n\

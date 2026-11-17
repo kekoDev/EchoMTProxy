@@ -151,6 +151,24 @@ struct Session {
     leftover: Vec<u8>,
 }
 
+/// A session ready to relay.
+struct Established {
+    upstream: TcpStream,
+    records: RecordReader,
+    ciphers: Ciphers,
+    label: usize,
+}
+
+/// What to do with a connection once everything before the relay is settled.
+enum Next {
+    Relay(Established),
+    /// Hand the connection, with these already-read bytes, to a mask site.
+    Mask(Vec<u8>),
+    /// Stay silent until the client gives up or the handshake deadline passes.
+    Drain,
+    Close,
+}
+
 fn unix_now() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -235,18 +253,24 @@ async fn drain(stream: &mut TcpStream) {
     while matches!(stream.read(&mut buf).await, Ok(n) if n > 0) {}
 }
 
-async fn run_session(client: TcpStream, session: Session, proxy: &Proxy) -> io::Result<()> {
+/// Connects to the DC and sends the upstream handshake together with any
+/// client payload that arrived behind the init.
+async fn connect_upstream(
+    session: Session,
+    proxy: &Proxy,
+) -> io::Result<(TcpStream, RecordReader, Ciphers)> {
     let Session {
         init,
         records,
         leftover,
     } = session;
     let ClientInit {
-        dec: mut client_dec,
+        dec: client_dec,
         enc: client_enc,
         dc_idx,
         keys,
     } = init;
+    let mut client_dec = Box::new(client_dec);
 
     let mut upstream = proxy.dc.connect(dc_idx).await?;
 
@@ -258,36 +282,33 @@ async fn run_session(client: TcpStream, session: Session, proxy: &Proxy) -> io::
                 Some((&keys.enc_key, &keys.enc_iv)),
             );
             first.extend_from_slice(&up.wire);
-            (Some(up.enc), None, None)
+            (Some(Box::new(up.enc)), None, None)
         }
         UpstreamMode::Obfuscated => {
             let up = obfs2::upstream_init(obfs2::random_init_seed(), None);
             first.extend_from_slice(&up.wire);
-            (Some(up.enc), Some(up.dec), Some(client_enc))
+            (
+                Some(Box::new(up.enc)),
+                Some(Box::new(up.dec)),
+                Some(Box::new(client_enc)),
+            )
         }
         UpstreamMode::Plain => {
             first.extend_from_slice(&TAG_SECURE);
-            (None, None, Some(client_enc))
+            (None, None, Some(Box::new(client_enc)))
         }
     };
 
     let header_len = first.len();
     first.extend_from_slice(&leftover);
-    drop(leftover);
     client_dec.apply(&mut first[header_len..]);
     if let Some(enc) = upstream_enc.as_mut() {
         enc.apply(&mut first[header_len..]);
     }
     upstream.write_all(&first).await?;
-    drop(first);
 
-    let (client_read, client_write) = client.into_split();
-    let (upstream_read, upstream_write) = upstream.into_split();
-    relay(
-        client_read,
-        client_write,
-        upstream_read,
-        upstream_write,
+    Ok((
+        upstream,
         records,
         Ciphers {
             client_dec,
@@ -295,40 +316,43 @@ async fn run_session(client: TcpStream, session: Session, proxy: &Proxy) -> io::
             upstream_dec,
             client_enc,
         },
-        proxy.idle_timeout,
-    )
-    .await
+    ))
 }
 
-pub async fn handle_client(mut stream: TcpStream, proxy: Arc<Proxy>) {
-    let _ = stream.set_nodelay(true);
-    let deadline = Instant::now() + proxy.handshake_timeout;
+/// Everything up to the relay: handshake, accounting and the upstream connect.
+async fn negotiate(stream: &mut TcpStream, proxy: &Proxy, deadline: Instant) -> Next {
     let stats = &proxy.stats;
     let mut seen = Seen::default();
 
-    let outcome =
-        tokio::time::timeout_at(deadline, handshake(&mut stream, &proxy, &mut seen)).await;
+    let outcome = tokio::time::timeout_at(deadline, handshake(stream, proxy, &mut seen)).await;
     let label = stats.label_index(seen.sni());
     let reason = match outcome {
         Ok(Ok(session)) => {
             stats.record_handshake(label, HandshakeResult::Accepted);
-            let _active = stats.session_started(label);
             drop(seen);
             let dc_idx = session.init.dc_idx;
-            if let Err(err) = run_session(stream, session, &proxy).await {
-                tracing::debug!(dc = dc_idx, error = %err, "session ended with error");
-            }
-            return;
+            return match connect_upstream(session, proxy).await {
+                Ok((upstream, records, ciphers)) => Next::Relay(Established {
+                    upstream,
+                    records,
+                    ciphers,
+                    label,
+                }),
+                Err(err) => {
+                    tracing::debug!(dc = dc_idx, error = %err, "upstream connect failed");
+                    Next::Close
+                }
+            };
         }
         Ok(Err(Reject::Io(err))) => {
             tracing::debug!(error = %err, "handshake aborted");
-            return;
+            return Next::Close;
         }
         Ok(Err(reason)) => reason,
         Err(_) => {
             stats.record_handshake(label, HandshakeResult::Timeout);
             tracing::debug!("handshake timed out");
-            return;
+            return Next::Close;
         }
     };
 
@@ -345,16 +369,52 @@ pub async fn handle_client(mut stream: TcpStream, proxy: Arc<Proxy>) {
     }
 
     if seen.replied {
-        let _ = tokio::time::timeout_at(deadline, drain(&mut stream)).await;
-        return;
+        Next::Drain
+    } else {
+        Next::Mask(seen.bytes)
     }
-    let (target, result) = proxy
-        .masker
-        .forward(&mut stream, &seen.bytes, seen.sni())
-        .await;
-    stats.record_mask(stats.label_index(Some(target)), result);
-    if result == MaskResult::Limited {
-        let _ = tokio::time::timeout_at(deadline, drain(&mut stream)).await;
+}
+
+/// Runs one client connection.
+///
+/// The future of this function is the task that lives as long as the session,
+/// so every idle client pays for its size. Each phase before the relay keeps
+/// buffers and cipher states in its own state, so those phases run as boxed
+/// futures that are freed when they finish; the relay itself is awaited inline
+/// and holds only pointers.
+pub async fn handle_client(mut stream: TcpStream, proxy: Arc<Proxy>) {
+    let _ = stream.set_nodelay(true);
+    let deadline = Instant::now() + proxy.handshake_timeout;
+
+    let next = Box::pin(negotiate(&mut stream, &proxy, deadline)).await;
+    match next {
+        Next::Relay(session) => {
+            let _active = proxy.stats.session_started(session.label);
+            let result = relay(
+                &stream,
+                &session.upstream,
+                session.records,
+                session.ciphers,
+                proxy.idle_timeout,
+            )
+            .await;
+            if let Err(err) = result {
+                tracing::debug!(error = %err, "session ended with error");
+            }
+        }
+        Next::Mask(bytes) => {
+            let sni = tls::client_hello_sni(&bytes);
+            let (target, result) = Box::pin(proxy.masker.forward(&mut stream, &bytes, sni)).await;
+            let stats = &proxy.stats;
+            stats.record_mask(stats.label_index(Some(target)), result);
+            if result == MaskResult::Limited {
+                let _ = Box::pin(tokio::time::timeout_at(deadline, drain(&mut stream))).await;
+            }
+        }
+        Next::Drain => {
+            let _ = Box::pin(tokio::time::timeout_at(deadline, drain(&mut stream))).await;
+        }
+        Next::Close => {}
     }
 }
 
@@ -419,6 +479,13 @@ mod tests {
         let handshake_size =
             std::mem::size_of_val(&handshake(&mut for_handshake, &proxy, &mut seen));
         let task_size = std::mem::size_of_val(&handle_client(accepted, proxy.clone()));
+
+        // Guards against buffers or cipher states creeping back into the
+        // state that every idle session keeps.
+        assert!(
+            task_size <= 1536,
+            "per-connection task is {task_size} bytes"
+        );
 
         println!("per-connection state, bytes:");
         println!("  handle_client future (the spawned task)  {task_size}");
