@@ -4,9 +4,9 @@ High-performance MTProto proxy in Rust — Fake-TLS, built for hundreds of thous
 
 Status: early. The proxy accepts Fake-TLS (`ee`) secrets, relays to Telegram DCs
 in direct mode, forwards failed handshakes to a mask site, enforces connection
-and idle limits and exports metrics. The buffer pool and per-core listeners are
-not implemented yet: an idle session currently costs about 54 KB of resident
-memory (two 16 KiB relay buffers plus task and allocator overhead).
+and idle limits and exports metrics. Idle sessions hold no relay buffer: on
+Linux an idle session costs about 4.4 KiB of resident memory in the proxy
+(measured by `tests/rss.rs`). Per-core listeners are not implemented yet.
 
 ## Build
 
@@ -84,6 +84,7 @@ text at `/metrics`:
 |---|---|---|
 | `echo_mtproxy_connections_open` | | client connections open, in any state |
 | `echo_mtproxy_connections_over_limit_total` | | connections refused because `max_connections` were open |
+| `echo_mtproxy_pool_buffers_in_use` | | relay buffers borrowed right now; idle sessions hold none |
 | `echo_mtproxy_handshakes_total` | `sni`, `result` | handshakes by outcome: `accepted`, `malformed`, `bad_digest`, `bad_timestamp`, `replay`, `bad_init`, `timeout` |
 | `echo_mtproxy_sessions_active` | `sni` | relayed sessions currently open |
 | `echo_mtproxy_mask_connections_total` | `target`, `result` | masked connections: `forwarded`, `connect_failed`, `limited` |
@@ -103,6 +104,9 @@ clients cannot create new series.
   `0` disables it.
 - `replay_cache_entries` sizes the replay cache. Its memory is fixed:
   85.3 bytes per entry, 171 MB at the default of 2 000 000.
+
+- `pin_workers` pins each worker thread to one CPU. Off by default and
+  unmeasured; try it together with per-CPU packet steering.
 
 ## Run
 
@@ -163,7 +167,16 @@ low. `SOAK_CONNECTIONS` changes the count.
 The memory test starts the real binary, opens 1 000 and then 50 000 idle
 sessions (`RSS_BASELINE_SESSIONS`, `RSS_SESSIONS`), and compares the proxy's
 VmRSS between the two, reporting kernel socket memory separately. It needs
-about 101 000 descriptors per process, so run it with `ulimit -n 200000`.
+about 101 000 descriptors per process, so run it with `ulimit -n 200000`. It
+fails above 8 KiB per idle session; CI runs it at 1 000 to 5 000 sessions.
+
+To see which allocation sites idle sessions keep alive (dhat, needs symbols):
+
+```sh
+CARGO_PROFILE_RELEASE_STRIP=false CARGO_PROFILE_RELEASE_DEBUG=1 \
+    cargo test --release --test heap_profile -- --ignored --nocapture
+cargo test --lib per_connection_state_sizes -- --nocapture   # size of the per-connection task
+```
 
 Fuzzing needs a nightly toolchain and `cargo install cargo-fuzz`:
 
