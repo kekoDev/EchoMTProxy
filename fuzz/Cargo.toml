@@ -1,0 +1,37 @@
+[package]
+name = "echo-mtproxy-fuzz"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+echo-mtproxy = { path = ".." }
+libfuzzer-sys = "0.4"
+rand_core = "0.6"
+
+[[bin]]
+name = "client_hello"
+path = "fuzz_targets/client_hello.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "record_reader"
+path = "fuzz_targets/record_reader.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "obfs2_init"
+path = "fuzz_targets/obfs2_init.rs"
+test = false
+doc = false
+bench = false
+
+# Keeps this crate out of any parent workspace; it needs a nightly toolchain.
+[workspace]
