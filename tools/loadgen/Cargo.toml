@@ -1,0 +1,16 @@
+[package]
+name = "echo-loadgen"
+version = "0.1.0"
+edition = "2021"
+authors = ["telegramvpn.org"]
+description = "Load generator and fake DC for echo-mtproxy"
+license = "Apache-2.0"
+publish = false
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+echo-mtproxy = { path = "../..", default-features = false }
+rand = "0.8"
+rlimit = "0.10"
+tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "time", "macros", "signal", "sync"] }

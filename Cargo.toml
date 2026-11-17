@@ -9,6 +9,11 @@ repository = "https://github.com/kekoDev/EchoMTProxy"
 readme = "README.md"
 publish = false
 
+[workspace]
+members = ["tools/loadgen"]
+# The fuzz crate needs a nightly toolchain and keeps its own lockfile.
+exclude = ["fuzz"]
+
 [dependencies]
 aes = "0.8"
 anyhow = "1"
