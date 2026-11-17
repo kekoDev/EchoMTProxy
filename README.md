@@ -202,6 +202,7 @@ the allowed window, or the server being unable to reach Telegram.
 ## Tests
 
 ```sh
+cargo test --workspace                       # everything below plus the load generator's tests
 cargo test                                   # unit, property, vector, integration and 10k-session soak tests
 cargo test --test integration -- --ignored   # also talk to real Telegram DCs
 cargo test --release --test rss -- --ignored --nocapture   # memory per idle session (Linux)
@@ -251,6 +252,71 @@ Telegram is reachable from there.
 `tests/vectors/mtprotoproxy.json` holds known-answer vectors produced by
 [alexbers/mtprotoproxy](https://github.com/alexbers/mtprotoproxy);
 `tests/vectors/gen_vectors.py` regenerates them.
+
+## Load testing
+
+`tools/loadgen` builds `echo-loadgen`, which plays both ends of the proxy: fake
+Telegram clients in front and a fake DC behind.
+
+```sh
+cargo build --release --workspace     # target/release/echo-loadgen
+
+# 1. Fake DC, where the proxy can reach it:
+echo-loadgen dc --listen 10.0.0.2:9001 --listen 10.0.0.2:9002
+
+# 2. Point ALL five of the proxy's DCs at it (config.toml), then start the proxy:
+#      [dc_override]
+#      1 = "10.0.0.2:9001"
+#      2 = "10.0.0.2:9002"
+#      ... 3, 4, 5
+
+# 3. Clients, from another machine if possible:
+echo-loadgen client --target PROXY:443 --secret ee... \
+    --connections 200000 --active 500 --mode download --payload 65536 \
+    --media-share 0.2 --hold-secs 120
+```
+
+- **It never loads Telegram.** The first five sessions are probes, one per DC
+  index, opened one at a time. If any of them does not get the fake DC's
+  answer, the run stops before opening anything else. So override all five
+  DCs: one left at its default is caught by its probe, at the cost of a single
+  connection.
+- `--active N` sessions move data (`echo`, `download` or `upload`); the rest
+  stay idle and cost the tool about 1.3 KiB each on the client side and 0.5 KiB
+  on the fake DC. Active sessions start once every session is open.
+- `--media-share` puts that share of sessions on the media lane, so media
+  limiting and congestion control are exercised.
+- Progress lines show open sessions, failures by kind, sessions closed by the
+  proxy, throughput and handshake and request latency percentiles.
+
+### Many connections on one machine
+
+One (source address, destination address, destination port) pair can carry
+about 28,000 connections with the default Linux port range, and only about
+14,000 before new connections become slow, because the kernel hands out the
+even half of the range first. That applies to both legs:
+
+- clients to proxy: add `--target` addresses or ports and `--bind` source
+  addresses; `echo-loadgen client` warns when a pair would exceed 14,000;
+- proxy to fake DC: add `upstream_bind_addrs` to the proxy and `--listen`
+  addresses to the fake DC, spread over the five `[dc_override]` entries.
+
+In a test with 100,000 sessions on one host, 4 client pairs and 5 upstream
+pairs took 45 s to open them with handshakes of up to 2 s; 10 and 20 pairs took
+4.5 s with a 99th-percentile handshake of 123 ms.
+
+Kernel settings for runs in the hundreds of thousands and above, on every
+machine involved:
+
+```sh
+sysctl -w fs.nr_open=4000000 fs.file-max=8000000
+sysctl -w net.ipv4.ip_local_port_range="1024 65535"
+sysctl -w net.core.somaxconn=65535 net.ipv4.tcp_max_syn_backlog=65535
+ulimit -n 4000000          # and LimitNOFILE= in the proxy's systemd unit
+```
+
+Connection tracking (`nf_conntrack`) must be off or sized for the connection
+count on these hosts, or it will drop connections long before the proxy does.
 
 ## License
 
