@@ -385,3 +385,67 @@ pub async fn serve(listener: TcpListener, proxy: Arc<Proxy>) {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::cipher::AesCtr;
+
+    async fn socket_pair() -> (TcpStream, TcpStream) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (client, accepted) = tokio::join!(TcpStream::connect(addr), listener.accept());
+        (client.unwrap(), accepted.unwrap().0)
+    }
+
+    fn proxy() -> Arc<Proxy> {
+        let config = Config::parse(
+            "secrets = [\"ee000102030405060708090a0b0c0d0e0f612e636f6d\"]\nmetrics_listen = \"\"",
+        )
+        .unwrap();
+        Arc::new(Proxy::from_config(&config).unwrap())
+    }
+
+    /// The task spawned per connection lives as long as the session, so its
+    /// size is paid by every idle client. Run with --nocapture to see it.
+    #[tokio::test]
+    async fn per_connection_state_sizes() {
+        let (_client, accepted) = socket_pair().await;
+        let (_client2, accepted2) = socket_pair().await;
+        let proxy = proxy();
+
+        let mut seen = Seen::default();
+        let mut for_handshake = accepted2;
+        let handshake_size =
+            std::mem::size_of_val(&handshake(&mut for_handshake, &proxy, &mut seen));
+        let task_size = std::mem::size_of_val(&handle_client(accepted, proxy.clone()));
+
+        println!("per-connection state, bytes:");
+        println!("  handle_client future (the spawned task)  {task_size}");
+        println!("  handshake future                         {handshake_size}");
+        println!(
+            "  AesCtr                                   {}",
+            std::mem::size_of::<AesCtr>()
+        );
+        println!(
+            "  relay::Ciphers                           {}",
+            std::mem::size_of::<Ciphers>()
+        );
+        println!(
+            "  Session                                  {}",
+            std::mem::size_of::<Session>()
+        );
+        println!(
+            "  ClientInit                               {}",
+            std::mem::size_of::<ClientInit>()
+        );
+        println!(
+            "  RecordReader                             {}",
+            std::mem::size_of::<RecordReader>()
+        );
+        println!(
+            "  TcpStream                                {}",
+            std::mem::size_of::<TcpStream>()
+        );
+    }
+}
