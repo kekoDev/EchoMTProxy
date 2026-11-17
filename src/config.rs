@@ -215,6 +215,8 @@ pub struct Config {
     pub listen: Vec<SocketAddr>,
     /// 0 means one worker per CPU.
     pub workers: usize,
+    /// Pin each worker thread to one CPU.
+    pub pin_workers: bool,
     pub secrets: Vec<String>,
     /// Default mask target, `host` or `host:port`. Empty means the domain of
     /// the first secret.
@@ -249,6 +251,7 @@ impl Default for Config {
                 SocketAddr::from(([0u16; 8], 443)),
             ],
             workers: 0,
+            pin_workers: false,
             secrets: Vec::new(),
             mask_host: String::new(),
             mask_domains: Vec::new(),
@@ -518,6 +521,7 @@ mod tests {
         assert_eq!(config.idle_timeout_secs, 900);
         assert!(config.prefer_ipv6_upstream);
         assert!(config.dc_override.is_empty());
+        assert!(!config.pin_workers);
         assert_eq!(config.mask_idle_timeout_secs, 120);
         assert_eq!(config.mask_dns_ttl_secs, 300);
     }

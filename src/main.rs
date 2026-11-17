@@ -1,5 +1,6 @@
 use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use anyhow::Context;
@@ -107,6 +108,41 @@ fn bind(addr: SocketAddr) -> std::io::Result<std::net::TcpListener> {
     Ok(socket.into())
 }
 
+/// The CPU for the `index`th runtime thread, or `None` to leave it unpinned.
+///
+/// The runtime starts its `workers` worker threads first; threads started
+/// later belong to the blocking pool (DNS lookups) and must stay free to run
+/// anywhere.
+fn cpu_for_thread(index: usize, workers: usize, cpus: usize) -> Option<usize> {
+    (index < workers && cpus > 0).then(|| index % cpus)
+}
+
+fn pin_worker_threads(runtime: &mut tokio::runtime::Builder, workers: usize) {
+    let Some(cpus) = core_affinity::get_core_ids().filter(|ids| !ids.is_empty()) else {
+        tracing::warn!("pin_workers is set but the CPU list is unavailable; not pinning");
+        return;
+    };
+    if workers > cpus.len() {
+        tracing::warn!(
+            workers,
+            cpus = cpus.len(),
+            "pin_workers: more workers than CPUs, some CPUs get several workers"
+        );
+    }
+    let started = AtomicUsize::new(0);
+    runtime.on_thread_start(move || {
+        let index = started.fetch_add(1, Ordering::Relaxed);
+        if let Some(slot) = cpu_for_thread(index, workers, cpus.len()) {
+            let cpu = cpus[slot];
+            if core_affinity::set_for_current(cpu) {
+                tracing::debug!(worker = index, cpu = cpu.id, "worker pinned");
+            } else {
+                tracing::warn!(worker = index, cpu = cpu.id, "could not pin worker");
+            }
+        }
+    });
+}
+
 async fn shutdown_signal() {
     #[cfg(unix)]
     {
@@ -142,10 +178,15 @@ fn main() -> anyhow::Result<()> {
     let config = Config::load(&args.config)?;
     let proxy = Arc::new(Proxy::from_config(&config)?);
 
+    let workers = if config.workers > 0 {
+        config.workers
+    } else {
+        std::thread::available_parallelism().map_or(1, |n| n.get())
+    };
     let mut runtime = tokio::runtime::Builder::new_multi_thread();
-    runtime.enable_all();
-    if config.workers > 0 {
-        runtime.worker_threads(config.workers);
+    runtime.enable_all().worker_threads(workers);
+    if config.pin_workers {
+        pin_worker_threads(&mut runtime, workers);
     }
     let runtime = runtime.build().context("starting the tokio runtime")?;
 
@@ -167,10 +208,36 @@ fn main() -> anyhow::Result<()> {
         tracing::info!(
             secrets = config.secrets.len(),
             upstream_mode = ?config.upstream_mode,
+            workers,
+            pinned = config.pin_workers,
             "proxy started"
         );
         shutdown_signal().await;
         tracing::info!("shutting down");
         anyhow::Ok(())
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::cpu_for_thread;
+
+    #[test]
+    fn workers_are_spread_over_cpus_in_order() {
+        let plan: Vec<_> = (0..4).map(|i| cpu_for_thread(i, 4, 8)).collect();
+        assert_eq!(plan, [Some(0), Some(1), Some(2), Some(3)]);
+    }
+
+    #[test]
+    fn extra_workers_wrap_around() {
+        let plan: Vec<_> = (0..5).map(|i| cpu_for_thread(i, 5, 2)).collect();
+        assert_eq!(plan, [Some(0), Some(1), Some(0), Some(1), Some(0)]);
+    }
+
+    #[test]
+    fn blocking_pool_threads_are_not_pinned() {
+        assert_eq!(cpu_for_thread(4, 4, 8), None);
+        assert_eq!(cpu_for_thread(100, 4, 8), None);
+        assert_eq!(cpu_for_thread(0, 4, 0), None);
+    }
 }
