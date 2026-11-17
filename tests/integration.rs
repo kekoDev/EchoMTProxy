@@ -1161,3 +1161,77 @@ async fn masked_connection_is_dropped_after_mask_idle_timeout() {
         "{idle:?}"
     );
 }
+
+/// A site that reads `expect` bytes and then ends the connection, either with
+/// a TCP reset or with a normal close.
+async fn spawn_closing_site(expect: usize, reset: bool) -> SocketAddr {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        loop {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            tokio::spawn(async move {
+                let mut buf = vec![0u8; expect];
+                if stream.read_exact(&mut buf).await.is_err() {
+                    return;
+                }
+                if reset {
+                    // Zero linger turns the close into an RST.
+                    socket2::SockRef::from(&stream)
+                        .set_linger(Some(Duration::ZERO))
+                        .unwrap();
+                }
+                drop(stream);
+            });
+        }
+    });
+    addr
+}
+
+#[tokio::test]
+async fn mask_site_reset_reaches_the_client_as_a_reset() {
+    let hello = signed_hello_for("reset.example", &[0x42; 16], unix_now());
+    let resetting = spawn_closing_site(hello.len(), true).await;
+    let closing = spawn_closing_site(hello.len(), false).await;
+    let (proxy, handle) = spawn_proxy_handle(&format!(
+        "secrets = [\"{SECRET_HEX}\"]\n\
+         mask_domains = [\"reset.example={resetting}\", \"close.example={closing}\"]\n\
+         mask_host = \"{closing}\"\n\
+         metrics_listen = \"\"\n"
+    ))
+    .await;
+
+    // Several rounds: the outcome must not depend on timing.
+    for round in 0..10 {
+        let mut stream = TcpStream::connect(proxy).await.unwrap();
+        stream.write_all(&hello).await.unwrap();
+        let mut buf = [0u8; 8];
+        let read = timeout(STEP, stream.read(&mut buf)).await.unwrap();
+        let err = read.expect_err("site reset arrived as a clean close");
+        assert_eq!(
+            err.kind(),
+            std::io::ErrorKind::ConnectionReset,
+            "round {round}"
+        );
+    }
+
+    // A site that closes normally must reach the client as a normal close.
+    let clean = signed_hello_for("close.example", &[0x42; 16], unix_now());
+    for round in 0..10 {
+        let mut stream = TcpStream::connect(proxy).await.unwrap();
+        stream.write_all(&clean).await.unwrap();
+        let mut buf = [0u8; 8];
+        let read = timeout(STEP, stream.read(&mut buf)).await.unwrap();
+        assert_eq!(read.unwrap(), 0, "round {round}");
+    }
+
+    let stats = handle.stats();
+    let reset = stats.label_index(Some("reset.example"));
+    for _ in 0..200 {
+        if stats.mask(reset, MaskResult::Forwarded) == 10 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(stats.mask(reset, MaskResult::Forwarded), 10);
+}
