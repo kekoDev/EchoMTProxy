@@ -42,8 +42,8 @@ upstream_bind_addrs = []
 # is spent. Chat connections are never limited.
 #
 # Both values are PER CONNECTION, not per user. A Telegram client fetches one
-# file over several media connections in parallel (commonly 4 to 8, depending
-# on the app and the file size), and each of them gets its own burst and rate.
+# file over several media connections in parallel (4 were observed in a
+# real-device test), and each of them gets its own burst and rate.
 # What a user sees is therefore roughly:
 #   burst  = media_burst_bytes x parallel connections
 #   speed  = media_rate_bps    x parallel connections

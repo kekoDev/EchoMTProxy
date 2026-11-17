@@ -110,7 +110,7 @@ media lane; everything else is chat. **Chat is never limited.**
   speed, then `media_rate_bps` (default 1 Mbit/s), upload and download counted
   together. `media_rate_bps = 0` turns limiting off.
 - Both are per connection, not per user. A Telegram client fetches one file
-  over several media connections in parallel (commonly 4 to 8), each with its
+  over several media connections in parallel (4 in a real-device test), each with its
   own burst and rate, so a user gets roughly the configured values times the
   number of connections: about 8 MB of burst and 4 Mbit/s with the defaults and
   4 connections.
