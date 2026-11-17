@@ -8,7 +8,22 @@ workers = 0                      # 0 = number of CPUs
 # The value below is an example (zero key, www.example.com). Replace it.
 secrets = ["ee000000000000000000000000000000007777772e6578616d706c652e636f6d"]
 
-mask_host = ""                   # empty = domain from secret
+# Masking: a connection that fails the handshake is forwarded, bytes and all,
+# to a real TLS site, so probes see that site's answers.
+#
+# mask_domains is an allowlist of SNI names. If the failed ClientHello carries
+# one of them (exact match, case-insensitive), the connection goes to that
+# entry; anything else goes to mask_host. The client's SNI only selects among
+# these entries and is never resolved itself.
+#   "domain"            forward to domain:443
+#   "domain=host:port"  forward to host:port (e.g. a site on this server)
+# Clients may use any listed domain with the same key:
+#   echo-mtproxy --gen-secret    new key, one link per listed domain
+#   echo-mtproxy --print-links   links for the keys already in `secrets`
+mask_domains = []
+# mask_domains = ["google.com", "facebook.com", "instagram.com", "site.example.org=127.0.0.1:8443"]
+mask_host = ""                   # host or host:port; empty = domain of the first secret
+mask_max_connections = 4096      # concurrent masked connections; beyond this, no reply
 prefer_ipv6_upstream = true
 
 # AES passes per byte (client->DC / DC->client):
@@ -34,7 +49,7 @@ replay_cache_entries = 2000000
 handshake_timeout_secs = 10
 idle_timeout_secs = 900
 max_connections = 2000000
-metrics_listen = "127.0.0.1:9100"
+metrics_listen = "127.0.0.1:9100" # Prometheus text at /metrics; "" disables
 cipher_backend = "rustcrypto"    # rustcrypto | openssl (openssl is not built yet)
 
 # Optional per-DC upstream address override (DC ids 1-5).

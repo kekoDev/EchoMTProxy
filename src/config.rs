@@ -11,6 +11,7 @@ pub const SECRET_KEY_LEN: usize = 16;
 const FAKE_TLS_PREFIX: u8 = 0xee;
 const SECURE_PREFIX: u8 = 0xdd;
 const MAX_DOMAIN_LEN: usize = 253;
+const DEFAULT_MASK_PORT: u16 = 443;
 
 #[derive(Debug, PartialEq, Eq, thiserror::Error)]
 pub enum SecretError {
@@ -98,6 +99,19 @@ impl Secret {
         })
     }
 
+    /// The same key presented under another domain. The domain is not part of
+    /// the handshake MAC, so every such secret is accepted wherever the key is.
+    pub fn with_domain(&self, domain: &str) -> Result<Self, SecretError> {
+        let domain = domain.to_ascii_lowercase();
+        if !valid_domain(&domain) {
+            return Err(SecretError::BadDomain);
+        }
+        Ok(Self {
+            key: self.key,
+            domain,
+        })
+    }
+
     pub fn to_hex(&self) -> String {
         format!(
             "ee{}{}",
@@ -112,6 +126,72 @@ impl Secret {
             self.to_hex()
         )
     }
+}
+
+/// One `(domain, tg:// link)` per domain, all carrying `secret`'s key.
+pub fn links_for_domains<'a>(
+    secret: &Secret,
+    domains: impl IntoIterator<Item = &'a str>,
+    server: &str,
+    port: u16,
+) -> Result<Vec<(String, String)>, SecretError> {
+    let mut out: Vec<(String, String)> = Vec::new();
+    for domain in domains {
+        let variant = secret.with_domain(domain)?;
+        if out.iter().all(|(seen, _)| *seen != variant.domain) {
+            out.push((variant.domain.clone(), variant.tg_link(server, port)));
+        }
+    }
+    Ok(out)
+}
+
+/// Where a masked connection is forwarded.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MaskTarget {
+    /// Hostname or IP literal.
+    pub host: String,
+    pub port: u16,
+}
+
+impl MaskTarget {
+    /// Parses `host`, `host:port`, `ip`, `ip:port` or `[ipv6]:port`.
+    /// The port defaults to 443.
+    pub fn parse(text: &str) -> anyhow::Result<Self> {
+        let text = text.trim();
+        if let Ok(addr) = text.parse::<SocketAddr>() {
+            return Ok(Self {
+                host: addr.ip().to_string(),
+                port: addr.port(),
+            });
+        }
+        if let Ok(ip) = text.parse::<std::net::IpAddr>() {
+            return Ok(Self {
+                host: ip.to_string(),
+                port: DEFAULT_MASK_PORT,
+            });
+        }
+        let (host, port) = match text.rsplit_once(':') {
+            Some((host, port)) => {
+                let port = port
+                    .parse::<u16>()
+                    .ok()
+                    .filter(|p| *p != 0)
+                    .with_context(|| format!("bad port in mask target {text:?}"))?;
+                (host, port)
+            }
+            None => (text, DEFAULT_MASK_PORT),
+        };
+        let host = host.to_ascii_lowercase();
+        anyhow::ensure!(valid_domain(&host), "bad host in mask target {text:?}");
+        Ok(Self { host, port })
+    }
+}
+
+/// An allowlisted SNI and the address its masked connections go to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MaskDomain {
+    pub domain: String,
+    pub target: MaskTarget,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
@@ -136,8 +216,12 @@ pub struct Config {
     /// 0 means one worker per CPU.
     pub workers: usize,
     pub secrets: Vec<String>,
-    /// Empty means the domain embedded in the secret.
+    /// Default mask target, `host` or `host:port`. Empty means the domain of
+    /// the first secret.
     pub mask_host: String,
+    /// SNI allowlist: `domain` or `domain=host:port`.
+    pub mask_domains: Vec<String>,
+    pub mask_max_connections: usize,
     pub upstream_mode: UpstreamMode,
     pub prefer_ipv6_upstream: bool,
     pub time_skew_behind_secs: u64,
@@ -164,6 +248,8 @@ impl Default for Config {
             workers: 0,
             secrets: Vec::new(),
             mask_host: String::new(),
+            mask_domains: Vec::new(),
+            mask_max_connections: 4096,
             upstream_mode: UpstreamMode::Fast,
             prefer_ipv6_upstream: true,
             time_skew_behind_secs: 600,
@@ -193,8 +279,16 @@ impl Config {
             config.cipher_backend == CipherBackend::Rustcrypto,
             "cipher_backend \"openssl\" is not available in this build"
         );
-        config.parsed_secrets()?;
+        let secrets = config.parsed_secrets()?;
         config.parsed_dc_overrides()?;
+        config.parsed_mask_domains()?;
+        config.default_mask(&secrets)?;
+        if !config.metrics_listen.is_empty() {
+            config
+                .metrics_listen
+                .parse::<SocketAddr>()
+                .context("`metrics_listen` must be empty or ip:port")?;
+        }
         Ok(config)
     }
 
@@ -213,6 +307,62 @@ impl Config {
                 Secret::parse(s).with_context(|| format!("secrets[{i}]"))
             })
             .collect()
+    }
+
+    pub fn parsed_mask_domains(&self) -> anyhow::Result<Vec<MaskDomain>> {
+        let mut out: Vec<MaskDomain> = Vec::with_capacity(self.mask_domains.len());
+        for entry in &self.mask_domains {
+            let (domain, target) = match entry.split_once('=') {
+                Some((domain, target)) => (domain.trim(), Some(target)),
+                None => (entry.trim(), None),
+            };
+            let domain = domain.to_ascii_lowercase();
+            anyhow::ensure!(
+                valid_domain(&domain),
+                "mask_domains entry {entry:?} is not a valid hostname"
+            );
+            anyhow::ensure!(
+                out.iter().all(|d| d.domain != domain),
+                "mask_domains lists {domain:?} twice"
+            );
+            let target = match target {
+                Some(target) => MaskTarget::parse(target)
+                    .with_context(|| format!("mask_domains entry {entry:?}"))?,
+                None => MaskTarget {
+                    host: domain.clone(),
+                    port: DEFAULT_MASK_PORT,
+                },
+            };
+            out.push(MaskDomain { domain, target });
+        }
+        Ok(out)
+    }
+
+    /// The target for handshakes whose SNI is not allowlisted, with the name
+    /// it is reported under.
+    pub fn default_mask(&self, secrets: &[Secret]) -> anyhow::Result<MaskDomain> {
+        if self.mask_host.trim().is_empty() {
+            let domain = secrets
+                .first()
+                .map(|s| s.domain.to_ascii_lowercase())
+                .context("no secret to take the default mask host from")?;
+            return Ok(MaskDomain {
+                target: MaskTarget {
+                    host: domain.clone(),
+                    port: DEFAULT_MASK_PORT,
+                },
+                domain,
+            });
+        }
+        let target = MaskTarget::parse(&self.mask_host).context("`mask_host`")?;
+        Ok(MaskDomain {
+            domain: target.host.clone(),
+            target,
+        })
+    }
+
+    pub fn metrics_addr(&self) -> Option<SocketAddr> {
+        self.metrics_listen.parse().ok()
     }
 
     /// Overrides as (zero-based DC index, address).
@@ -380,6 +530,135 @@ mod tests {
         let bad = format!("ee{KEY_HEX}");
         let err = Config::parse(&format!("secrets = [\"{bad}\"]")).unwrap_err();
         assert!(!format!("{err:#}").contains(KEY_HEX));
+    }
+
+    #[test]
+    fn with_domain_keeps_the_key() {
+        let secret = Secret::parse(&ee("a.com")).unwrap();
+        let other = secret.with_domain("Google.COM").unwrap();
+        assert_eq!(other.key, secret.key);
+        assert_eq!(other.domain, "google.com");
+        assert_eq!(other.to_hex(), ee("google.com"));
+        assert_eq!(secret.with_domain("no pe"), Err(SecretError::BadDomain));
+    }
+
+    #[test]
+    fn links_share_one_key_across_domains() {
+        let secret = Secret::parse(&ee("a.com")).unwrap();
+        let links = links_for_domains(
+            &secret,
+            ["google.com", "Facebook.com", "google.com", "a.com"],
+            "198.51.100.7",
+            443,
+        )
+        .unwrap();
+        let domains: Vec<&str> = links.iter().map(|(d, _)| d.as_str()).collect();
+        assert_eq!(domains, ["google.com", "facebook.com", "a.com"]);
+        for (domain, link) in &links {
+            let hex_secret = link.rsplit("secret=").next().unwrap();
+            let parsed = Secret::parse(hex_secret).unwrap();
+            assert_eq!(parsed.key, secret.key);
+            assert_eq!(&parsed.domain, domain);
+            assert!(link.starts_with("tg://proxy?server=198.51.100.7&port=443&secret=ee"));
+        }
+        assert!(links_for_domains(&secret, ["bad domain"], "h", 1).is_err());
+        assert!(links_for_domains(&secret, [], "h", 1).unwrap().is_empty());
+    }
+
+    #[test]
+    fn mask_target_forms() {
+        let parse = |s: &str| MaskTarget::parse(s).map(|t| (t.host, t.port));
+        assert_eq!(parse("example.com").unwrap(), ("example.com".into(), 443));
+        assert_eq!(
+            parse("Example.com:8443").unwrap(),
+            ("example.com".into(), 8443)
+        );
+        assert_eq!(parse("127.0.0.1").unwrap(), ("127.0.0.1".into(), 443));
+        assert_eq!(parse("127.0.0.1:8443").unwrap(), ("127.0.0.1".into(), 8443));
+        assert_eq!(parse("[::1]:8443").unwrap(), ("::1".into(), 8443));
+        assert_eq!(parse("::1").unwrap(), ("::1".into(), 443));
+        for bad in [
+            "",
+            ":443",
+            "host:",
+            "host:0",
+            "host:99999",
+            "ho st",
+            "a/b:1",
+        ] {
+            assert!(parse(bad).is_err(), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn mask_domains_allowlist() {
+        let base = format!("secrets = [\"{}\"]\n", ee("first.example"));
+        let config = Config::parse(&format!(
+            "{base}mask_domains = [\"Google.com\", \"local.example = 127.0.0.1:8443\"]"
+        ))
+        .unwrap();
+        let domains = config.parsed_mask_domains().unwrap();
+        assert_eq!(domains.len(), 2);
+        assert_eq!(domains[0].domain, "google.com");
+        assert_eq!(
+            domains[0].target,
+            MaskTarget {
+                host: "google.com".into(),
+                port: 443
+            }
+        );
+        assert_eq!(domains[1].domain, "local.example");
+        assert_eq!(
+            domains[1].target,
+            MaskTarget {
+                host: "127.0.0.1".into(),
+                port: 8443
+            }
+        );
+
+        for bad in [
+            "[\"a.com\", \"A.com\"]",
+            "[\"bad domain\"]",
+            "[\"a.com=\"]",
+            "[\"a.com=host:0\"]",
+            "[\"\"]",
+        ] {
+            assert!(
+                Config::parse(&format!("{base}mask_domains = {bad}")).is_err(),
+                "{bad}"
+            );
+        }
+    }
+
+    #[test]
+    fn default_mask_host() {
+        let base = format!(
+            "secrets = [\"{}\", \"{}\"]\n",
+            ee("First.example"),
+            ee("b.com")
+        );
+        let config = Config::parse(&base).unwrap();
+        let secrets = config.parsed_secrets().unwrap();
+        let mask = config.default_mask(&secrets).unwrap();
+        assert_eq!(mask.domain, "first.example");
+        assert_eq!(mask.target.port, 443);
+
+        let config = Config::parse(&format!("{base}mask_host = \"127.0.0.1:8080\"")).unwrap();
+        let mask = config.default_mask(&secrets).unwrap();
+        assert_eq!(mask.domain, "127.0.0.1");
+        assert_eq!(mask.target.port, 8080);
+
+        assert!(Config::parse(&format!("{base}mask_host = \"bad host\"")).is_err());
+    }
+
+    #[test]
+    fn metrics_listen_may_be_disabled() {
+        let base = format!("secrets = [\"{}\"]\n", ee("a.com"));
+        let config = Config::parse(&format!("{base}metrics_listen = \"\"")).unwrap();
+        assert_eq!(config.metrics_addr(), None);
+        let config = Config::parse(&base).unwrap();
+        assert_eq!(config.metrics_addr(), "127.0.0.1:9100".parse().ok());
+        assert!(Config::parse(&format!("{base}metrics_listen = \"nope\"")).is_err());
     }
 
     #[test]
