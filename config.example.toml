@@ -48,6 +48,8 @@ replay_cache_entries = 2000000
 
 handshake_timeout_secs = 10
 idle_timeout_secs = 900          # close a session after this long with no bytes either way; 0 = never
+# Client connections open at once, in any state. Connections beyond this get no
+# reply: a few are held silently until the handshake timeout, the rest are closed.
 max_connections = 2000000
 metrics_listen = "127.0.0.1:9100" # Prometheus text at /metrics; "" disables
 cipher_backend = "rustcrypto"    # rustcrypto | openssl (openssl is not built yet)

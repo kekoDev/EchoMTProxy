@@ -5,6 +5,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use rand::Rng;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::Semaphore;
 use tokio::time::Instant;
 
 use crate::cipher::Ctr;
@@ -22,6 +23,12 @@ use crate::tls::{
 // Fake certificate size range used by mtprotoproxy before it learns the real one.
 const FAKE_CERT_LEN: std::ops::Range<usize> = 1024..4096;
 const ACCEPT_ERROR_BACKOFF: Duration = Duration::from_millis(50);
+// Over-limit connections are held silently so the refusal looks like a slow
+// server rather than an instant close. Holding costs a descriptor each, so only
+// this share of max_connections may be held; the rest are closed at once.
+const OVERFLOW_SHARE: usize = 16;
+const OVERFLOW_HELD_MIN: usize = 16;
+const OVERFLOW_HELD_MAX: usize = 4096;
 
 /// Everything a connection needs, shared by all of them.
 pub struct Proxy {
@@ -33,6 +40,8 @@ pub struct Proxy {
     handshake_timeout: Duration,
     /// `None` when `idle_timeout_secs` is 0.
     idle_timeout: Option<Duration>,
+    max_connections: u64,
+    overflow_slots: Arc<Semaphore>,
     masker: Masker,
     stats: Arc<Stats>,
 }
@@ -76,6 +85,11 @@ impl Proxy {
             handshake_timeout: Duration::from_secs(config.handshake_timeout_secs),
             idle_timeout: (config.idle_timeout_secs > 0)
                 .then(|| Duration::from_secs(config.idle_timeout_secs)),
+            max_connections: config.max_connections as u64,
+            overflow_slots: Arc::new(Semaphore::new(
+                (config.max_connections / OVERFLOW_SHARE)
+                    .clamp(OVERFLOW_HELD_MIN, OVERFLOW_HELD_MAX),
+            )),
             masker,
             stats: Arc::new(stats),
         })
@@ -346,8 +360,20 @@ pub async fn handle_client(mut stream: TcpStream, proxy: Arc<Proxy>) {
 pub async fn serve(listener: TcpListener, proxy: Arc<Proxy>) {
     loop {
         match listener.accept().await {
-            Ok((stream, _)) => {
-                tokio::spawn(handle_client(stream, proxy.clone()));
+            Ok((mut stream, _)) => {
+                let proxy = proxy.clone();
+                if let Some(slot) = proxy.stats.admit_connection(proxy.max_connections) {
+                    tokio::spawn(async move {
+                        handle_client(stream, proxy).await;
+                        drop(slot);
+                    });
+                } else if let Ok(held) = proxy.overflow_slots.clone().try_acquire_owned() {
+                    tokio::spawn(async move {
+                        let _ =
+                            tokio::time::timeout(proxy.handshake_timeout, drain(&mut stream)).await;
+                        drop(held);
+                    });
+                }
             }
             Err(err) => {
                 // Typically EMFILE/ENFILE: back off instead of spinning.

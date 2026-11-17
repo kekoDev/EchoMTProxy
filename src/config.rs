@@ -272,6 +272,10 @@ impl Config {
         anyhow::ensure!(!config.listen.is_empty(), "`listen` must not be empty");
         anyhow::ensure!(!config.secrets.is_empty(), "`secrets` must not be empty");
         anyhow::ensure!(
+            config.max_connections > 0,
+            "`max_connections` must be greater than 0"
+        );
+        anyhow::ensure!(
             config.replay_cache_entries > 0,
             "`replay_cache_entries` must be greater than 0"
         );
@@ -516,6 +520,7 @@ mod tests {
         assert!(Config::parse(&format!("{base}listen = []")).is_err());
         assert!(Config::parse(&format!("{base}cipher_backend = \"openssl\"")).is_err());
         assert!(Config::parse(&format!("{base}replay_cache_entries = 0")).is_err());
+        assert!(Config::parse(&format!("{base}max_connections = 0")).is_err());
         assert!(Config::parse("").is_err());
     }
 

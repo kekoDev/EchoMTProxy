@@ -1048,3 +1048,95 @@ async fn idle_session_is_closed_and_active_one_is_kept() {
         "{quiet:?}"
     );
 }
+
+#[tokio::test]
+async fn connections_over_the_limit_get_silence() {
+    let dc = spawn_echo_dc(true).await;
+    let blackhole = spawn_blackhole().await;
+    let (proxy, handle) = spawn_proxy_handle(&format!(
+        "secrets = [\"{SECRET_HEX}\"]\n\
+         max_connections = 2\n\
+         handshake_timeout_secs = 2\n\
+         mask_host = \"{blackhole}\"\n\
+         metrics_listen = \"\"\n\
+         [dc_override]\n\
+         {DC} = \"{dc}\"\n"
+    ))
+    .await;
+    let stats = handle.stats();
+
+    let mut first = Client::connect(proxy, DC).await;
+    let mut second = Client::connect(proxy, DC).await;
+    assert_eq!(first.echo(b"one").await, b"one");
+    assert_eq!(second.echo(b"two").await, b"two");
+    assert_eq!(stats.connections_open(), 2);
+
+    // A third client with a perfectly valid hello gets nothing back, and the
+    // connection is dropped once the handshake timeout passes.
+    let mut third = TcpStream::connect(proxy).await.unwrap();
+    third
+        .write_all(&signed_hello(&secret().key, unix_now()))
+        .await
+        .unwrap();
+    assert!(stays_silent(&mut third).await);
+    assert_eq!(stats.connections_over_limit(), 1);
+    assert_eq!(stats.connections_open(), 2);
+    let mut buf = [0u8; 8];
+    let read = timeout(Duration::from_secs(5), third.read(&mut buf)).await;
+    assert!(matches!(
+        read.expect("held past the handshake timeout"),
+        Ok(0) | Err(_)
+    ));
+
+    // Existing sessions are untouched, and a freed slot is usable again.
+    assert_eq!(first.echo(b"still here").await, b"still here");
+    drop(second);
+    for _ in 0..200 {
+        if stats.connections_open() == 1 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(stats.connections_open(), 1);
+    let mut replacement = Client::connect(proxy, DC).await;
+    assert_eq!(replacement.echo(b"new").await, b"new");
+    assert_eq!(stats.connections_over_limit(), 1);
+}
+
+#[tokio::test]
+async fn held_over_limit_connections_are_bounded() {
+    let blackhole = spawn_blackhole().await;
+    let (proxy, handle) = spawn_proxy_handle(&format!(
+        "secrets = [\"{SECRET_HEX}\"]\n\
+         max_connections = 1\n\
+         handshake_timeout_secs = 30\n\
+         mask_host = \"{blackhole}\"\n\
+         metrics_listen = \"\"\n"
+    ))
+    .await;
+
+    // One admitted connection (idle in its handshake), then a flood.
+    let _admitted = TcpStream::connect(proxy).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let mut flood = Vec::new();
+    for _ in 0..80 {
+        flood.push(TcpStream::connect(proxy).await.unwrap());
+    }
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    // With max_connections = 1 the proxy holds at most 16; the rest are closed.
+    let mut held = 0;
+    let mut closed = 0;
+    for stream in &mut flood {
+        let mut buf = [0u8; 1];
+        match timeout(Duration::from_millis(20), stream.read(&mut buf)).await {
+            Err(_) => held += 1,
+            Ok(Ok(0)) | Ok(Err(_)) => closed += 1,
+            Ok(Ok(_)) => panic!("over-limit connection received data"),
+        }
+    }
+    assert_eq!(held, 16);
+    assert_eq!(closed, 64);
+    assert_eq!(handle.stats().connections_over_limit(), 80);
+    assert_eq!(handle.stats().connections_open(), 1);
+}

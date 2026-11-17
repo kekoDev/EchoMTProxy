@@ -133,6 +133,19 @@ pub struct Stats {
     labels: Vec<String>,
     lookup: HashMap<String, usize>,
     counters: Vec<LabelCounters>,
+    connections_open: AtomicU64,
+    connections_over_limit: AtomicU64,
+}
+
+/// Keeps a client connection counted as open until dropped.
+pub struct OpenConnection {
+    stats: Arc<Stats>,
+}
+
+impl Drop for OpenConnection {
+    fn drop(&mut self) {
+        self.stats.connections_open.fetch_sub(1, Ordering::Relaxed);
+    }
 }
 
 /// Keeps a session counted as active until dropped.
@@ -172,7 +185,30 @@ impl Stats {
             labels,
             lookup,
             counters,
+            connections_open: AtomicU64::new(0),
+            connections_over_limit: AtomicU64::new(0),
         }
+    }
+
+    /// Counts a new client connection, unless `max` are already open. A
+    /// refused connection is counted as over the limit instead.
+    pub fn admit_connection(self: &Arc<Self>, max: u64) -> Option<OpenConnection> {
+        if self.connections_open.fetch_add(1, Ordering::Relaxed) >= max {
+            self.connections_open.fetch_sub(1, Ordering::Relaxed);
+            self.connections_over_limit.fetch_add(1, Ordering::Relaxed);
+            return None;
+        }
+        Some(OpenConnection {
+            stats: self.clone(),
+        })
+    }
+
+    pub fn connections_open(&self) -> u64 {
+        self.connections_open.load(Ordering::Relaxed)
+    }
+
+    pub fn connections_over_limit(&self) -> u64 {
+        self.connections_over_limit.load(Ordering::Relaxed)
     }
 
     /// Index of the series an SNI is counted under.
@@ -238,6 +274,19 @@ impl Stats {
     }
 
     fn render_into(&self, out: &mut String) -> std::fmt::Result {
+        writeln!(
+            out,
+            "# HELP echo_mtproxy_connections_open Client connections currently open, \
+             including handshaking and masked ones.\n\
+             # TYPE echo_mtproxy_connections_open gauge\n\
+             echo_mtproxy_connections_open {}\n\
+             # HELP echo_mtproxy_connections_over_limit_total Connections refused because \
+             max_connections were open.\n\
+             # TYPE echo_mtproxy_connections_over_limit_total counter\n\
+             echo_mtproxy_connections_over_limit_total {}",
+            self.connections_open(),
+            self.connections_over_limit()
+        )?;
         out.push_str(
             "# HELP echo_mtproxy_handshakes_total Client handshakes by SNI and outcome.\n\
              # TYPE echo_mtproxy_handshakes_total counter\n",
@@ -474,6 +523,54 @@ mod tests {
         drop((b, c));
         assert_eq!(stats.active_sessions(0), 0);
         assert_eq!(stats.active_sessions(2), 0);
+    }
+
+    #[test]
+    fn connection_admission_respects_the_limit() {
+        let stats = stats();
+        let a = stats.admit_connection(2).unwrap();
+        let b = stats.admit_connection(2).unwrap();
+        assert!(stats.admit_connection(2).is_none());
+        assert!(stats.admit_connection(2).is_none());
+        assert_eq!(stats.connections_open(), 2);
+        assert_eq!(stats.connections_over_limit(), 2);
+
+        drop(a);
+        assert_eq!(stats.connections_open(), 1);
+        let c = stats.admit_connection(2).unwrap();
+        assert!(stats.admit_connection(2).is_none());
+        drop((b, c));
+        assert_eq!(stats.connections_open(), 0);
+        assert_eq!(stats.connections_over_limit(), 3);
+        assert!(stats.admit_connection(0).is_none());
+
+        let text = stats.render();
+        assert!(text.contains("\necho_mtproxy_connections_open 0\n"));
+        assert!(text.contains("\necho_mtproxy_connections_over_limit_total 4\n"));
+    }
+
+    #[test]
+    fn concurrent_admission_never_exceeds_the_limit() {
+        let stats = stats();
+        let handles: Vec<_> = (0..8)
+            .map(|_| {
+                let stats = stats.clone();
+                std::thread::spawn(move || {
+                    let mut admitted = 0u64;
+                    for _ in 0..20_000 {
+                        if let Some(slot) = stats.admit_connection(3) {
+                            assert!(stats.connections_open() <= 3 + 8);
+                            admitted += 1;
+                            drop(slot);
+                        }
+                    }
+                    admitted
+                })
+            })
+            .collect();
+        let admitted: u64 = handles.into_iter().map(|h| h.join().unwrap()).sum();
+        assert_eq!(stats.connections_open(), 0);
+        assert_eq!(admitted + stats.connections_over_limit(), 160_000);
     }
 
     #[test]
