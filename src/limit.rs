@@ -99,6 +99,10 @@ pub struct Limits {
     congestion_threshold_bps: f64,
     /// Current media scale as 16.16 fixed point.
     scale: AtomicU32,
+    /// `media_rate` times the scale, in both forms, refreshed when the scale
+    /// changes so the per-read path only loads them.
+    effective_rate: AtomicU64,
+    effective_rate_q32: AtomicU64,
     media_bytes: ShardedCounter,
     chat_bytes: ShardedCounter,
     throttled: AtomicU64,
@@ -128,7 +132,10 @@ impl Limits {
         link_capacity_bps: u64,
         congestion_threshold: f64,
     ) -> Self {
+        let rate = Rate::new(media_rate_bps / 8);
         Self {
+            effective_rate: AtomicU64::new(rate.bytes_per_sec),
+            effective_rate_q32: AtomicU64::new(rate.q32),
             media_rate: media_rate_bps / 8,
             media_burst: media_burst_bytes,
             congestion_threshold_bps: link_capacity_bps as f64 * congestion_threshold,
@@ -186,16 +193,45 @@ impl Limits {
         let egress = total.saturating_sub(previous) as f64 * 8.0 / secs;
         self.egress_bps.store(egress as u64, Ordering::Relaxed);
         let scale = next_scale(self.scale(), egress, self.congestion_threshold_bps);
-        self.scale.store(
-            (scale * f64::from(SCALE_ONE)).round() as u32,
-            Ordering::Relaxed,
-        );
+        let fixed = (scale * f64::from(SCALE_ONE)).round() as u32;
+        self.scale.store(fixed, Ordering::Relaxed);
+        let rate = Rate::new((self.media_rate * u64::from(fixed)) >> 16);
+        self.effective_rate
+            .store(rate.bytes_per_sec, Ordering::Relaxed);
+        self.effective_rate_q32.store(rate.q32, Ordering::Relaxed);
     }
 
     #[inline]
+    fn effective_rate(&self) -> Rate {
+        Rate {
+            bytes_per_sec: self.effective_rate.load(Ordering::Relaxed),
+            q32: self.effective_rate_q32.load(Ordering::Relaxed),
+        }
+    }
+
+    #[cfg(test)]
     fn effective_media_rate(&self) -> u64 {
-        let scale = u64::from(self.scale.load(Ordering::Relaxed));
-        ((self.media_rate * scale) >> 16).max(1)
+        self.effective_rate().bytes_per_sec
+    }
+}
+
+/// A rate in the two forms the bucket needs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Rate {
+    bytes_per_sec: u64,
+    /// Bytes per nanosecond as 32.32 fixed point, so that crediting elapsed
+    /// time is one multiplication and no division.
+    q32: u64,
+}
+
+impl Rate {
+    fn new(bytes_per_sec: u64) -> Self {
+        let bytes_per_sec = bytes_per_sec.max(1);
+        let q32 = (u128::from(bytes_per_sec) << 32) / NANOS_PER_SEC;
+        Self {
+            bytes_per_sec,
+            q32: u64::try_from(q32).unwrap_or(u64::MAX).max(1),
+        }
     }
 }
 
@@ -208,6 +244,13 @@ struct Bucket {
     tokens: AtomicI64,
     /// Time up to which refill has been credited, in ns since `epoch`.
     credited_ns: AtomicU64,
+    /// Fraction of a byte earned but not yet credited, in 2^-32 bytes, so the
+    /// remainder of each refill is carried instead of lost.
+    fraction: AtomicU64,
+    /// Bytes relayed since the last charge and not yet charged.
+    pending: AtomicU64,
+    /// How many bytes may stay pending before the next charge.
+    slack: AtomicU64,
 }
 
 /// What charging a read did to the bucket.
@@ -224,42 +267,79 @@ impl Bucket {
         Self {
             tokens: AtomicI64::new(i64::try_from(burst).unwrap_or(i64::MAX)),
             credited_ns: AtomicU64::new(0),
+            fraction: AtomicU64::new(0),
+            pending: AtomicU64::new(0),
+            slack: AtomicU64::new(burst / 2),
         }
     }
 
-    fn charge(&self, bytes: u64, now_ns: u64, rate: u64, burst: u64) -> Charge {
+    /// Charges `bytes`, reading the clock only when the outcome can matter.
+    ///
+    /// A bucket holding T tokens cannot run dry before T more bytes pass,
+    /// whatever the time. So after a charge leaves T tokens, up to T/2 bytes
+    /// are only added up; the clock is read, and everything charged, once
+    /// that much has accumulated. A session far from its limit pays an add
+    /// and a compare per read. A session at its limit has no slack and is
+    /// charged on every read, so throttling stays smooth.
+    ///
+    /// Charging late never grants more than charging on time would: refill is
+    /// capped at the burst before the accumulated bytes are taken off.
+    #[inline]
+    fn charge_when_due(
+        &self,
+        bytes: u64,
+        now_ns: impl FnOnce() -> u64,
+        rate: Rate,
+        burst: u64,
+    ) -> Option<Charge> {
+        let pending = self.pending.load(Ordering::Relaxed).saturating_add(bytes);
+        if pending < self.slack.load(Ordering::Relaxed) {
+            self.pending.store(pending, Ordering::Relaxed);
+            return None;
+        }
+        let charge = self.charge(pending, now_ns(), rate, burst);
+        self.pending.store(0, Ordering::Relaxed);
+        let left = self.tokens.load(Ordering::Relaxed);
+        self.slack
+            .store(u64::try_from(left).unwrap_or(0) / 2, Ordering::Relaxed);
+        Some(charge)
+    }
+
+    #[inline]
+    fn charge(&self, bytes: u64, now_ns: u64, rate: Rate, burst: u64) -> Charge {
         let burst = i64::try_from(burst).unwrap_or(i64::MAX);
-        let rate = u128::from(rate.max(1));
-        let credited = self.credited_ns.load(Ordering::Relaxed);
         let mut tokens = self.tokens.load(Ordering::Relaxed);
 
-        let elapsed = u128::from(now_ns.saturating_sub(credited));
-        let earned = elapsed * rate / NANOS_PER_SEC;
-        if earned > 0 {
-            let earned_i64 = i64::try_from(earned).unwrap_or(i64::MAX);
-            if tokens.saturating_add(earned_i64) >= burst {
-                tokens = burst;
-                self.credited_ns.store(now_ns, Ordering::Relaxed);
-            } else {
-                tokens += earned_i64;
-                // Credit only the time those whole bytes cost, so the
-                // fraction of a byte left over is not lost on every read.
-                let paid_ns = (earned * NANOS_PER_SEC / rate) as u64;
-                self.credited_ns
-                    .store(credited.saturating_add(paid_ns), Ordering::Relaxed);
-            }
+        let elapsed = now_ns.saturating_sub(self.credited_ns.load(Ordering::Relaxed));
+        let earned_q32 = u128::from(elapsed) * u128::from(rate.q32)
+            + u128::from(self.fraction.load(Ordering::Relaxed));
+        let earned = i64::try_from(earned_q32 >> 32).unwrap_or(i64::MAX);
+        self.credited_ns.store(now_ns, Ordering::Relaxed);
+        if tokens.saturating_add(earned) >= burst {
+            tokens = burst;
+            self.fraction.store(0, Ordering::Relaxed);
+        } else {
+            tokens += earned;
+            self.fraction
+                .store(earned_q32 as u64 & u64::from(u32::MAX), Ordering::Relaxed);
         }
         let was_full = tokens >= burst;
 
         tokens = tokens.saturating_sub(i64::try_from(bytes).unwrap_or(i64::MAX));
         self.tokens.store(tokens, Ordering::Relaxed);
-        let wait = if tokens >= 0 {
-            Duration::ZERO
-        } else {
-            let nanos = u128::from(tokens.unsigned_abs()) * NANOS_PER_SEC / rate;
-            Duration::from_nanos(u64::try_from(nanos).unwrap_or(u64::MAX))
-        };
-        Charge { wait, was_full }
+        if tokens >= 0 {
+            return Charge {
+                wait: Duration::ZERO,
+                was_full,
+            };
+        }
+        // Only a session in debt pays for a division.
+        let nanos =
+            u128::from(tokens.unsigned_abs()) * NANOS_PER_SEC / u128::from(rate.bytes_per_sec);
+        Charge {
+            wait: Duration::from_nanos(u64::try_from(nanos).unwrap_or(u64::MAX)),
+            was_full,
+        }
     }
 }
 
@@ -329,13 +409,12 @@ impl<'a> SessionTraffic<'a> {
         }
 
         let bucket = self.bucket.as_ref()?;
-        let now_ns = u64::try_from(self.epoch.elapsed().as_nanos()).unwrap_or(u64::MAX);
-        let charge = bucket.charge(
+        let charge = bucket.charge_when_due(
             bytes,
-            now_ns,
-            self.limits.effective_media_rate(),
+            || u64::try_from(self.epoch.elapsed().as_nanos()).unwrap_or(u64::MAX),
+            self.limits.effective_rate(),
             self.limits.media_burst,
-        );
+        )?;
         if charge.was_full && self.paced.load(Ordering::Relaxed) {
             // The session has been quiet long enough to earn its whole burst
             // back, so the kernel may send at full speed again.
@@ -396,7 +475,7 @@ mod tests {
         let bucket = Bucket::new(BURST);
         let mut sent = 0;
         while sent + 16_384 <= BURST {
-            let charge = bucket.charge(16_384, sent / 1000, RATE, BURST);
+            let charge = bucket.charge(16_384, sent / 1000, Rate::new(RATE), BURST);
             assert_eq!(charge.wait, Duration::ZERO, "after {sent} bytes");
             sent += 16_384;
         }
@@ -406,15 +485,17 @@ mod tests {
     #[test]
     fn debt_is_paid_at_the_sustained_rate() {
         let bucket = Bucket::new(BURST);
-        bucket.charge(BURST, 0, RATE, BURST);
+        bucket.charge(BURST, 0, Rate::new(RATE), BURST);
         // 375 000 bytes over the burst cost exactly one second at 3 Mbit/s.
-        let charge = bucket.charge(RATE, 0, RATE, BURST);
+        let charge = bucket.charge(RATE, 0, Rate::new(RATE), BURST);
         assert_eq!(charge.wait, Duration::from_secs(1));
         // After waiting it out, the next 16 KiB cost 16 384 / 375 000 s.
-        let charge = bucket.charge(16_384, SEC, RATE, BURST);
-        assert_eq!(
-            charge.wait.as_micros(),
-            16_384 * 1_000_000 / u128::from(RATE)
+        let charge = bucket.charge(16_384, SEC, Rate::new(RATE), BURST);
+        let expected = 16_384 * 1_000_000 / u128::from(RATE);
+        assert!(
+            charge.wait.as_micros().abs_diff(expected) < 10,
+            "{:?}",
+            charge.wait
         );
     }
 
@@ -425,7 +506,7 @@ mod tests {
         let mut sent = 0u64;
         // A sender that always waits exactly as long as it is told.
         while now < 600 * SEC {
-            let charge = bucket.charge(16_384, now, RATE, BURST);
+            let charge = bucket.charge(16_384, now, Rate::new(RATE), BURST);
             sent += 16_384;
             now += charge.wait.as_nanos() as u64 + 50_000;
         }
@@ -442,7 +523,7 @@ mod tests {
         let mut now = 0u64;
         let mut waited = 0u128;
         for _ in 0..100_000 {
-            let charge = bucket.charge(100, now, RATE, 0);
+            let charge = bucket.charge(100, now, Rate::new(RATE), 0);
             waited = charge.wait.as_nanos();
             now += 100_000;
         }
@@ -454,26 +535,30 @@ mod tests {
     #[test]
     fn idle_time_refills_up_to_the_burst_only() {
         let bucket = Bucket::new(BURST);
-        bucket.charge(BURST, 0, RATE, BURST);
+        bucket.charge(BURST, 0, Rate::new(RATE), BURST);
         // Ten seconds earn 3.75 MB: not full yet.
-        let charge = bucket.charge(0, 10 * SEC, RATE, BURST);
+        let charge = bucket.charge(0, 10 * SEC, Rate::new(RATE), BURST);
         assert!(!charge.was_full);
-        assert_eq!(bucket.tokens.load(Ordering::Relaxed), 3_750_000);
+        // Within the fixed-point rate's precision (under one part per million).
+        assert!(bucket.tokens.load(Ordering::Relaxed).abs_diff(3_750_000) < 10);
         // A day later it is full, and no fuller than the burst.
-        let charge = bucket.charge(0, 86_400 * SEC, RATE, BURST);
+        let charge = bucket.charge(0, 86_400 * SEC, Rate::new(RATE), BURST);
         assert!(charge.was_full);
         assert_eq!(bucket.tokens.load(Ordering::Relaxed), BURST as i64);
-        let charge = bucket.charge(BURST + RATE, 86_400 * SEC, RATE, BURST);
+        let charge = bucket.charge(BURST + RATE, 86_400 * SEC, Rate::new(RATE), BURST);
         assert_eq!(charge.wait, Duration::from_secs(1));
     }
 
     #[test]
     fn rate_changes_apply_to_the_next_read() {
         let bucket = Bucket::new(0);
-        assert_eq!(bucket.charge(RATE, 0, RATE, 0).wait, Duration::from_secs(1));
+        assert_eq!(
+            bucket.charge(RATE, 0, Rate::new(RATE), 0).wait,
+            Duration::from_secs(1)
+        );
         // Same debt, half the rate: twice the wait.
         assert_eq!(
-            bucket.charge(0, 0, RATE / 2, 0).wait,
+            bucket.charge(0, 0, Rate::new(RATE / 2), 0).wait,
             Duration::from_secs(2)
         );
     }
@@ -481,12 +566,128 @@ mod tests {
     #[test]
     fn extreme_inputs_do_not_overflow() {
         let bucket = Bucket::new(u64::MAX);
-        let charge = bucket.charge(u64::MAX, u64::MAX, u64::MAX, u64::MAX);
+        let charge = bucket.charge(u64::MAX, u64::MAX, Rate::new(u64::MAX), u64::MAX);
         assert!(charge.was_full);
         let bucket = Bucket::new(0);
-        let charge = bucket.charge(u64::MAX, 0, 0, 0);
+        let charge = bucket.charge(u64::MAX, 0, Rate::new(0), 0);
         assert!(charge.wait > Duration::from_secs(1_000_000));
-        bucket.charge(u64::MAX, 5 * MS, 1, 0);
+        bucket.charge(u64::MAX, 5 * MS, Rate::new(1), 0);
+    }
+
+    #[test]
+    fn clock_is_not_read_while_plenty_of_burst_is_left() {
+        let bucket = Bucket::new(BURST);
+        let clock_reads = std::cell::Cell::new(0u32);
+        let mut sent = 0u64;
+        let mut charges = 0u32;
+        // 4 MB of a 10 MB burst in 16 KiB reads.
+        while sent < 4_000_000 {
+            let charged = bucket.charge_when_due(
+                16_384,
+                || {
+                    clock_reads.set(clock_reads.get() + 1);
+                    sent / 1000
+                },
+                Rate::new(RATE),
+                BURST,
+            );
+            assert!(charged.as_ref().is_none_or(|c| c.wait.is_zero()));
+            charges += u32::from(charged.is_some());
+            sent += 16_384;
+        }
+        assert_eq!(clock_reads.get(), 0, "clock read with 6 MB of burst left");
+        assert_eq!(charges, 0);
+
+        // The first charge happens at half the burst, and covers everything
+        // sent until then.
+        while clock_reads.get() == 0 {
+            bucket.charge_when_due(
+                16_384,
+                || {
+                    clock_reads.set(clock_reads.get() + 1);
+                    0
+                },
+                Rate::new(RATE),
+                BURST,
+            );
+            sent += 16_384;
+        }
+        assert!((5_000_000..5_020_000).contains(&sent), "{sent}");
+        assert_eq!(
+            bucket.tokens.load(Ordering::Relaxed),
+            BURST as i64 - sent as i64
+        );
+        assert_eq!(bucket.pending.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn a_session_at_its_limit_is_charged_on_every_read() {
+        let bucket = Bucket::new(BURST);
+        // Spend the whole burst.
+        let mut now = 0u64;
+        let mut reads_until_empty = 0;
+        while bucket.tokens.load(Ordering::Relaxed) > 0
+            || bucket.pending.load(Ordering::Relaxed) > 0
+        {
+            bucket.charge_when_due(16_384, || now, Rate::new(RATE), BURST);
+            reads_until_empty += 1;
+            assert!(reads_until_empty < 10_000);
+        }
+        // From here on every read is charged and told how long to wait.
+        for _ in 0..200 {
+            let charge = bucket
+                .charge_when_due(16_384, || now, Rate::new(RATE), BURST)
+                .expect("a read at the limit was not charged");
+            assert!(charge.wait > Duration::ZERO);
+            now += charge.wait.as_nanos() as u64;
+        }
+    }
+
+    #[test]
+    fn deferred_charging_keeps_the_long_run_rate_and_never_overgrants() {
+        // A sender that waits as told, with idle gaps, against an exact
+        // bucket charged on every read with the same traffic.
+        let lazy = Bucket::new(BURST);
+        let exact = Bucket::new(BURST);
+        let mut now = 0u64;
+        let mut sent = 0u64;
+        let mut seed = 0x2545_f491_4f6c_dd1du64;
+        let mut next = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        let mut idle_ns = 0u64;
+        while now < 3600 * SEC {
+            let bytes = 1 + next() % 16_384;
+            let wait = lazy
+                .charge_when_due(bytes, || now, Rate::new(RATE), BURST)
+                .map_or(0, |c| c.wait.as_nanos() as u64);
+            exact.charge(bytes, now, Rate::new(RATE), BURST);
+            sent += bytes;
+            // Whenever the lazy bucket is up to date it holds no more than
+            // the exact one.
+            if lazy.pending.load(Ordering::Relaxed) == 0 {
+                assert!(
+                    lazy.tokens.load(Ordering::Relaxed) <= exact.tokens.load(Ordering::Relaxed) + 1,
+                    "over-granted at {now} ns"
+                );
+            }
+            now += wait + 20_000;
+            // Now and then the session goes quiet for up to a minute.
+            if next() % 5000 == 0 {
+                let gap = next() % (60 * SEC);
+                idle_ns += gap;
+                now += gap;
+            }
+        }
+        // Never more than the burst plus what the rate allows over the hour.
+        let allowed = BURST + RATE * 3600 + 16_384;
+        assert!(sent <= allowed, "sent {sent}, allowed {allowed}");
+        // And not much less: only refill lost to idle time above a full bucket.
+        let floor = RATE * (3600 - idle_ns / SEC - 60);
+        assert!(sent >= floor, "sent {sent}, floor {floor}");
     }
 
     #[test]
