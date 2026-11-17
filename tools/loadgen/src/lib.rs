@@ -6,6 +6,7 @@
 //! the far end does not answer like the fake DC, so a misconfigured proxy is
 //! never used to send load to Telegram.
 
+pub mod client;
 pub mod dc;
 pub mod proto;
 pub mod stats;
