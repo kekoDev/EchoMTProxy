@@ -2,11 +2,10 @@
 
 High-performance MTProto proxy in Rust — Fake-TLS, built for hundreds of thousands of users per server.
 
-Status: phase 1. The proxy accepts Fake-TLS (`ee`) secrets and relays to Telegram
-DCs in direct mode. Masking of failed handshakes, connection limits, the buffer
-pool and metrics are not implemented yet; several config keys are accepted but
-have no effect until then (`mask_host`, `idle_timeout_secs`, `max_connections`,
-`metrics_listen`).
+Status: early. The proxy accepts Fake-TLS (`ee`) secrets, relays to Telegram DCs
+in direct mode, forwards failed handshakes to a mask site and exports metrics.
+Connection limits, idle timeouts and the buffer pool are not implemented yet;
+`idle_timeout_secs` and `max_connections` are accepted but have no effect.
 
 ## Build
 
@@ -27,6 +26,17 @@ This prints a new `ee` secret and the matching `tg://proxy?...` link. The domain
 is what the connection claims to be in its TLS ClientHello; pick a real,
 TLS 1.3 capable site that is plausible for your server's network.
 
+With `mask_domains` set in the config (see below), one key serves every listed
+domain:
+
+```sh
+echo-mtproxy --config config.toml --gen-secret --server proxy.example.org   # new key, one link per domain
+echo-mtproxy --config config.toml --print-links --server proxy.example.org  # links for the existing keys
+```
+
+Put the printed `secret:` value into `secrets`. The domain inside a secret is
+not part of the handshake check, so a single entry accepts all of the links.
+
 ## Configure
 
 Copy `config.example.toml` to `config.toml` and put the generated secret into
@@ -39,6 +49,44 @@ Copy `config.example.toml` to `config.toml` and put the generated secret into
 | `fast`       | 2                     | 0                     | default                       |
 | `obfuscated` | 2                     | 2                     |                               |
 | `plain`      | 1                     | 1                     | experimental                  |
+
+## Masking
+
+A connection that fails the handshake (wrong key, replay, clock skew, or not
+Fake-TLS at all) is forwarded to a real TLS site together with the bytes already
+read, and then spliced in both directions. A probe therefore sees that site's
+certificate and answers.
+
+- `mask_domains` is an allowlist. If the failed ClientHello's SNI is listed
+  (exact match, case-insensitive; subdomains do not match), the connection goes
+  to that entry. Write `"domain"` to forward to `domain:443`, or
+  `"domain=host:port"` to forward elsewhere, for example to a site hosted on
+  the same server.
+- Any other SNI, or none, goes to `mask_host` (default: the domain of the first
+  secret).
+- The SNI only selects among configured targets. The proxy never connects to a
+  name supplied by a client.
+- `mask_max_connections` caps concurrent masked connections. Beyond it, failed
+  handshakes get no reply.
+
+A handshake that fails after the proxy has already sent its ServerHello (a bad
+obfuscated2 init) cannot be masked and gets no further reply.
+
+## Metrics
+
+`metrics_listen` (default `127.0.0.1:9100`, `""` to disable) serves Prometheus
+text at `/metrics`:
+
+| metric | labels | meaning |
+|---|---|---|
+| `echo_mtproxy_handshakes_total` | `sni`, `result` | handshakes by outcome: `accepted`, `malformed`, `bad_digest`, `bad_timestamp`, `replay`, `bad_init`, `timeout` |
+| `echo_mtproxy_sessions_active` | `sni` | relayed sessions currently open |
+| `echo_mtproxy_mask_connections_total` | `target`, `result` | masked connections: `forwarded`, `connect_failed`, `limited` |
+| `echo_mtproxy_skew_rejected_seconds` | `direction` | histogram of clock offsets of skew rejections, `behind` or `ahead` |
+
+`sni` takes only names known at startup: the `mask_domains` entries, the default
+mask host and the secrets' domains. Every other SNI is counted as `_other`, so
+clients cannot create new series.
 
 ## Run
 
