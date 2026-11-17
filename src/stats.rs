@@ -348,7 +348,9 @@ impl Stats {
              echo_mtproxy_relay_bytes_total{{lane=\"media\"}} {}\n\
              echo_mtproxy_relay_bytes_total{{lane=\"chat\"}} {}\n\
              # HELP echo_mtproxy_egress_bits_per_second Relay egress over the last \
-             congestion-control tick.\n\
+             congestion-control tick (200 ms). An instantaneous sample: it reads 0 \
+             between bursts, so average it over time or derive a rate from \
+             echo_mtproxy_relay_bytes_total instead.\n\
              # TYPE echo_mtproxy_egress_bits_per_second gauge\n\
              echo_mtproxy_egress_bits_per_second {}\n\
              # HELP echo_mtproxy_congestion_scale Share of the configured media rate \
@@ -675,6 +677,10 @@ mod tests {
         for line in [
             "echo_mtproxy_relay_bytes_total{lane=\"media\"} 0",
             "echo_mtproxy_relay_bytes_total{lane=\"chat\"} 0",
+            "# HELP echo_mtproxy_egress_bits_per_second Relay egress over the last \
+             congestion-control tick (200 ms). An instantaneous sample: it reads 0 between \
+             bursts, so average it over time or derive a rate from \
+             echo_mtproxy_relay_bytes_total instead.",
             "echo_mtproxy_egress_bits_per_second 0",
             "echo_mtproxy_congestion_scale 1.0000",
             "echo_mtproxy_media_connections_throttled 0",

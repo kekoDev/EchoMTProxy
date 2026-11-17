@@ -223,7 +223,7 @@ pub struct Config {
     pub mask_domains: Vec<String>,
     pub mask_max_connections: usize,
     /// Bytes a media session may relay at full speed before `media_rate_bps`
-    /// applies.
+    /// applies. Per connection, like the rate.
     pub media_burst_bytes: u64,
     /// Sustained rate of one media session, bits per second, both directions
     /// together. 0 disables media limiting.
@@ -268,8 +268,11 @@ impl Default for Config {
             mask_host: String::new(),
             mask_domains: Vec::new(),
             mask_max_connections: 4096,
-            media_burst_bytes: 10_000_000,
-            media_rate_bps: 3_000_000,
+            // Per connection. A Telegram client downloads one file over
+            // several media connections at once, so a user gets a multiple
+            // of these.
+            media_burst_bytes: 2_000_000,
+            media_rate_bps: 1_000_000,
             link_capacity_bps: 5_000_000_000,
             congestion_threshold: 0.85,
             mask_idle_timeout_secs: 120,
@@ -561,8 +564,8 @@ mod tests {
         assert!(config.dc_override.is_empty());
         assert!(config.upstream_bind_addrs.is_empty());
         assert_eq!(config.mask_idle_timeout_secs, 120);
-        assert_eq!(config.media_burst_bytes, 10_000_000);
-        assert_eq!(config.media_rate_bps, 3_000_000);
+        assert_eq!(config.media_burst_bytes, 2_000_000);
+        assert_eq!(config.media_rate_bps, 1_000_000);
         assert_eq!(config.link_capacity_bps, 5_000_000_000);
         assert_eq!(config.congestion_threshold, 0.85);
         assert_eq!(config.mask_dns_ttl_secs, 300);

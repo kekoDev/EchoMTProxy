@@ -40,8 +40,18 @@ upstream_bind_addrs = []
 # directions counted together. It is slowed by reading later, never by dropping
 # data, and the kernel paces its client socket at the same rate once the burst
 # is spent. Chat connections are never limited.
-media_burst_bytes = 10000000     # 10 MB
-media_rate_bps = 3000000         # 3 Mbit/s per media connection; 0 = unlimited
+#
+# Both values are PER CONNECTION, not per user. A Telegram client fetches one
+# file over several media connections in parallel (commonly 4 to 8, depending
+# on the app and the file size), and each of them gets its own burst and rate.
+# What a user sees is therefore roughly:
+#   burst  = media_burst_bytes x parallel connections
+#   speed  = media_rate_bps    x parallel connections
+# With the defaults and 4 connections that is 8 MB at full speed, then about
+# 4 Mbit/s. Pick the per-connection values by dividing what you want a user to
+# get by the number of connections you observe.
+media_burst_bytes = 2000000      # 2 MB per media connection
+media_rate_bps = 1000000         # 1 Mbit/s per media connection; 0 = unlimited
 
 # Congestion control. When the proxy's relay egress exceeds
 # congestion_threshold x link_capacity_bps, every media rate is scaled down by

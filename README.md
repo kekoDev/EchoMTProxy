@@ -88,7 +88,7 @@ text at `/metrics`:
 | `echo_mtproxy_connections_over_limit_total` | | connections refused because `max_connections` were open |
 | `echo_mtproxy_pool_buffers_in_use` | | relay buffers borrowed right now; idle sessions hold none |
 | `echo_mtproxy_relay_bytes_total` | `lane` | bytes relayed, both directions, `media` or `chat` |
-| `echo_mtproxy_egress_bits_per_second` | | relay egress over the last congestion-control tick |
+| `echo_mtproxy_egress_bits_per_second` | | relay egress over the last 200 ms congestion-control tick; an instantaneous sample that reads 0 between bursts |
 | `echo_mtproxy_congestion_scale` | | share of the media rate currently allowed (1 = no congestion) |
 | `echo_mtproxy_media_connections_throttled` | | media connections waiting on their rate limit right now |
 | `echo_mtproxy_upstream_retries_total` | `result` | DC connections reset before answering and retried: `reconnected`, `failed` |
@@ -106,9 +106,14 @@ clients cannot create new series.
 Telegram clients mark media connections with a negative DC index. Those are the
 media lane; everything else is chat. **Chat is never limited.**
 
-- Each media connection may relay `media_burst_bytes` (default 10 MB) at full
-  speed, then `media_rate_bps` (default 3 Mbit/s), upload and download counted
+- Each media connection may relay `media_burst_bytes` (default 2 MB) at full
+  speed, then `media_rate_bps` (default 1 Mbit/s), upload and download counted
   together. `media_rate_bps = 0` turns limiting off.
+- Both are per connection, not per user. A Telegram client fetches one file
+  over several media connections in parallel (commonly 4 to 8), each with its
+  own burst and rate, so a user gets roughly the configured values times the
+  number of connections: about 8 MB of burst and 4 Mbit/s with the defaults and
+  4 connections.
 - A limited connection is slowed by reading from it later, so TCP backpressure
   does the work and nothing is dropped. Once its burst is spent the kernel also
   paces its client socket at the same rate (`SO_MAX_PACING_RATE`, Linux); the
