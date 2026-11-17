@@ -11,6 +11,7 @@ use tokio::time::Instant;
 use crate::cipher::Ctr;
 use crate::config::{Config, Secret, UpstreamMode};
 use crate::dc::DcTable;
+use crate::limit::{Direction, Lane, Limits, SessionTraffic};
 use crate::mask::Masker;
 use crate::obfs2::{self, ClientInit, InitError, INIT_LEN, TAG_SECURE};
 use crate::relay::{relay, Ciphers};
@@ -69,11 +70,18 @@ impl Proxy {
             Duration::from_secs(config.mask_idle_timeout_secs),
             Duration::from_secs(config.mask_dns_ttl_secs),
         );
-        let stats = Stats::new(
+        let limits = Limits::new(
+            config.media_rate_bps,
+            config.media_burst_bytes,
+            config.link_capacity_bps,
+            config.congestion_threshold,
+        );
+        let stats = Stats::with_limits(
             masker
                 .target_names()
                 .map(str::to_owned)
                 .chain(secrets.iter().map(|s| s.domain.clone())),
+            limits,
         );
         Ok(Self {
             secrets,
@@ -157,6 +165,9 @@ struct Established {
     records: RecordReader,
     ciphers: Ciphers,
     label: usize,
+    lane: Lane,
+    /// Client payload already sent upstream together with the handshake.
+    early_bytes: usize,
 }
 
 /// What to do with a connection once everything before the relay is settled.
@@ -258,7 +269,7 @@ async fn drain(stream: &mut TcpStream) {
 async fn connect_upstream(
     session: Session,
     proxy: &Proxy,
-) -> io::Result<(TcpStream, RecordReader, Ciphers)> {
+) -> io::Result<(TcpStream, RecordReader, Ciphers, usize)> {
     let Session {
         init,
         records,
@@ -316,6 +327,7 @@ async fn connect_upstream(
             upstream_dec,
             client_enc,
         },
+        leftover.len(),
     ))
 }
 
@@ -332,11 +344,13 @@ async fn negotiate(stream: &mut TcpStream, proxy: &Proxy, deadline: Instant) -> 
             drop(seen);
             let dc_idx = session.init.dc_idx;
             return match connect_upstream(session, proxy).await {
-                Ok((upstream, records, ciphers)) => Next::Relay(Established {
+                Ok((upstream, records, ciphers, early_bytes)) => Next::Relay(Established {
                     upstream,
                     records,
                     ciphers,
                     label,
+                    lane: Lane::from_dc_idx(dc_idx),
+                    early_bytes,
                 }),
                 Err(err) => {
                     tracing::debug!(dc = dc_idx, error = %err, "upstream connect failed");
@@ -390,15 +404,19 @@ pub async fn handle_client(mut stream: TcpStream, proxy: Arc<Proxy>) {
     match next {
         Next::Relay(session) => {
             let _active = proxy.stats.session_started(session.label);
-            let result = relay(
+            let traffic = SessionTraffic::new(session.lane, &proxy.stats.limits, &stream);
+            // Counted and charged like any relayed bytes; too small to wait for.
+            let _ = traffic.account(Direction::Up, session.early_bytes);
+            let ended = relay(
                 &stream,
                 &session.upstream,
                 session.records,
                 session.ciphers,
                 proxy.idle_timeout,
+                &traffic,
             )
             .await;
-            if let Err(err) = result {
+            if let Some(err) = ended.error {
                 tracing::debug!(error = %err, "session ended with error");
             }
         }

@@ -7,6 +7,8 @@ use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
+use crate::limit::Limits;
+
 /// Upper bounds, in seconds, of the clock-offset histogram buckets. Offsets
 /// above the last bound land in an implicit +Inf bucket.
 pub const SKEW_BUCKETS_SECS: [u64; 7] = [60, 300, 900, 1800, 3600, 21_600, 86_400];
@@ -136,6 +138,8 @@ pub struct Stats {
     connections_open: AtomicU64,
     connections_over_limit: AtomicU64,
     connections_accepted: AtomicU64,
+    /// Lane byte counters, media limits and the congestion scale.
+    pub limits: Limits,
 }
 
 /// Keeps a client connection counted as open until dropped.
@@ -169,6 +173,10 @@ fn normalize(name: &str) -> String {
 
 impl Stats {
     pub fn new(names: impl IntoIterator<Item = String>) -> Self {
+        Self::with_limits(names, Limits::unlimited())
+    }
+
+    pub fn with_limits(names: impl IntoIterator<Item = String>, limits: Limits) -> Self {
         let mut labels: Vec<String> = Vec::new();
         let mut lookup = HashMap::new();
         for name in names {
@@ -189,6 +197,7 @@ impl Stats {
             connections_open: AtomicU64::new(0),
             connections_over_limit: AtomicU64::new(0),
             connections_accepted: AtomicU64::new(0),
+            limits,
         }
     }
 

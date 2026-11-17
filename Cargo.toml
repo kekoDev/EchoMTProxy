@@ -27,6 +27,10 @@ toml = "0.8"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
+[target.'cfg(target_os = "linux")'.dependencies]
+# setsockopt for the two socket options socket2 does not expose.
+libc = "0.2"
+
 [features]
 default = ["mimalloc"]
 # mimalloc as the global allocator of the binary. Measured on the target server

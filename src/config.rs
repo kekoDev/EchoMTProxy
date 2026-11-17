@@ -222,6 +222,17 @@ pub struct Config {
     /// SNI allowlist: `domain` or `domain=host:port`.
     pub mask_domains: Vec<String>,
     pub mask_max_connections: usize,
+    /// Bytes a media session may relay at full speed before `media_rate_bps`
+    /// applies.
+    pub media_burst_bytes: u64,
+    /// Sustained rate of one media session, bits per second, both directions
+    /// together. 0 disables media limiting.
+    pub media_rate_bps: u64,
+    /// Real throughput of the uplink, bits per second. 0 disables congestion
+    /// control.
+    pub link_capacity_bps: u64,
+    /// Share of `link_capacity_bps` above which media rates are scaled down.
+    pub congestion_threshold: f64,
     pub mask_idle_timeout_secs: u64,
     /// 0 resolves the mask host on every masked connection.
     pub mask_dns_ttl_secs: u64,
@@ -253,6 +264,10 @@ impl Default for Config {
             mask_host: String::new(),
             mask_domains: Vec::new(),
             mask_max_connections: 4096,
+            media_burst_bytes: 10_000_000,
+            media_rate_bps: 3_000_000,
+            link_capacity_bps: 5_000_000_000,
+            congestion_threshold: 0.85,
             mask_idle_timeout_secs: 120,
             mask_dns_ttl_secs: 300,
             upstream_mode: UpstreamMode::Fast,
@@ -279,6 +294,14 @@ impl Config {
         anyhow::ensure!(
             config.mask_idle_timeout_secs > 0,
             "`mask_idle_timeout_secs` must be greater than 0"
+        );
+        anyhow::ensure!(
+            config.congestion_threshold > 0.0 && config.congestion_threshold <= 1.0,
+            "`congestion_threshold` must be above 0 and at most 1"
+        );
+        anyhow::ensure!(
+            config.media_rate_bps == 0 || config.media_rate_bps >= 8,
+            "`media_rate_bps` must be 0 (unlimited) or at least 8"
         );
         anyhow::ensure!(
             config.max_connections > 0,
@@ -519,6 +542,10 @@ mod tests {
         assert!(config.prefer_ipv6_upstream);
         assert!(config.dc_override.is_empty());
         assert_eq!(config.mask_idle_timeout_secs, 120);
+        assert_eq!(config.media_burst_bytes, 10_000_000);
+        assert_eq!(config.media_rate_bps, 3_000_000);
+        assert_eq!(config.link_capacity_bps, 5_000_000_000);
+        assert_eq!(config.congestion_threshold, 0.85);
         assert_eq!(config.mask_dns_ttl_secs, 300);
     }
 
@@ -532,6 +559,11 @@ mod tests {
         assert!(Config::parse(&format!("{base}cipher_backend = \"openssl\"")).is_err());
         assert!(Config::parse(&format!("{base}replay_cache_entries = 0")).is_err());
         assert!(Config::parse(&format!("{base}max_connections = 0")).is_err());
+        assert!(Config::parse(&format!("{base}congestion_threshold = 0.0")).is_err());
+        assert!(Config::parse(&format!("{base}congestion_threshold = 1.5")).is_err());
+        assert!(Config::parse(&format!("{base}media_rate_bps = 5")).is_err());
+        assert!(Config::parse(&format!("{base}media_rate_bps = 0")).is_ok());
+        assert!(Config::parse(&format!("{base}link_capacity_bps = 0")).is_ok());
         assert!(Config::parse(&format!("{base}mask_idle_timeout_secs = 0")).is_err());
         assert!(Config::parse(&format!("{base}mask_dns_ttl_secs = 0")).is_ok());
         assert!(Config::parse("").is_err());

@@ -8,6 +8,7 @@ use std::time::Duration;
 
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 use echo_mtproxy::cipher::AesCtr;
+use echo_mtproxy::limit::{Lane, Limits, SessionTraffic};
 use echo_mtproxy::relay::{relay, Ciphers};
 use echo_mtproxy::tls::{self, RecordReader};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -58,12 +59,15 @@ fn start(runtime: &tokio::runtime::Runtime, mode: &str) -> (TcpStream, TcpStream
         runtime.block_on(async { (socket_pair().await, socket_pair().await) });
     let ciphers = ciphers(mode);
     runtime.spawn(async move {
+        let limits = Limits::unlimited();
+        let traffic = SessionTraffic::new(Lane::Chat, &limits, &proxy_client);
         relay(
             &proxy_client,
             &proxy_upstream,
             RecordReader::new(),
             ciphers,
             Some(Duration::from_secs(900)),
+            &traffic,
         )
         .await
     });

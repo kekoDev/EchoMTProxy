@@ -28,6 +28,22 @@ mask_idle_timeout_secs = 120     # drop a masked connection when either directio
 mask_dns_ttl_secs = 300          # how long a resolved mask host is reused; 0 = resolve every time
 prefer_ipv6_upstream = true
 
+# Media limiting. A connection whose client marks it as media (negative DC
+# index) may relay media_burst_bytes at full speed, then media_rate_bps, both
+# directions counted together. It is slowed by reading later, never by dropping
+# data, and the kernel paces its client socket at the same rate once the burst
+# is spent. Chat connections are never limited.
+media_burst_bytes = 10000000     # 10 MB
+media_rate_bps = 3000000         # 3 Mbit/s per media connection; 0 = unlimited
+
+# Congestion control. When the proxy's relay egress exceeds
+# congestion_threshold x link_capacity_bps, every media rate is scaled down by
+# the same proportion (to no less than 5%), then recovers 10% per 200 ms.
+# Set link_capacity_bps to the measured real throughput of your uplink, not
+# the nominal port speed. 0 disables congestion control.
+link_capacity_bps = 5000000000   # 5 Gbit/s
+congestion_threshold = 0.85
+
 # AES passes per byte (client->DC / DC->client):
 #   fast        2 / 0   obfuscated upstream reusing the client's key for the DC->client leg
 #   obfuscated  2 / 2   obfuscated upstream with independent keys

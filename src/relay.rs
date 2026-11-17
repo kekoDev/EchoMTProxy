@@ -5,6 +5,7 @@ use std::time::Duration;
 use tokio::net::TcpStream;
 
 use crate::cipher::{AesCtr, Ctr};
+use crate::limit::{Direction, SessionTraffic};
 use crate::pool;
 use crate::tls::{record_header, RecordReader, MAX_RECORD_PAYLOAD, RECORD_HEADER_LEN};
 
@@ -39,6 +40,38 @@ pub(crate) async fn write_all(stream: &TcpStream, mut data: &[u8]) -> io::Result
     Ok(())
 }
 
+/// Which side ended a session.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClosedBy {
+    Client,
+    Dc,
+    /// Neither side sent anything for the idle timeout.
+    Idle,
+}
+
+impl ClosedBy {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Client => "client",
+            Self::Dc => "dc",
+            Self::Idle => "idle",
+        }
+    }
+}
+
+/// How a relay ended: who closed, and the error if it was not a clean close.
+#[derive(Debug)]
+pub struct Ended {
+    pub by: ClosedBy,
+    pub error: Option<io::Error>,
+}
+
+type DirectionResult = Result<(), (ClosedBy, io::Error)>;
+
+fn on(side: ClosedBy) -> impl Fn(io::Error) -> (ClosedBy, io::Error) {
+    move |err| (side, err)
+}
+
 async fn client_to_upstream(
     client: &TcpStream,
     upstream: &TcpStream,
@@ -46,30 +79,43 @@ async fn client_to_upstream(
     mut dec: Box<AesCtr>,
     mut enc: Option<Box<AesCtr>>,
     activity: &AtomicU64,
-) -> io::Result<()> {
+    traffic: &SessionTraffic<'_>,
+) -> DirectionResult {
     loop {
         // No buffer is held while waiting here: this is where idle sessions sit.
-        client.readable().await?;
-        let mut buf = pool::take();
-        let n = match client.try_read(&mut buf) {
-            Ok(0) => return Ok(()),
-            Ok(n) => n,
-            Err(err) if err.kind() == io::ErrorKind::WouldBlock => continue,
-            Err(err) => return Err(err),
+        client.readable().await.map_err(on(ClosedBy::Client))?;
+        let wait = {
+            let mut buf = pool::take();
+            let n = match client.try_read(&mut buf) {
+                Ok(0) => return Ok(()),
+                Ok(n) => n,
+                Err(err) if err.kind() == io::ErrorKind::WouldBlock => continue,
+                Err(err) => return Err((ClosedBy::Client, err)),
+            };
+            activity.fetch_add(1, Ordering::Relaxed);
+            let len = records.unwrap_in_place(&mut buf, n).map_err(|e| {
+                (
+                    ClosedBy::Client,
+                    io::Error::new(io::ErrorKind::InvalidData, e),
+                )
+            })?;
+            if len == 0 {
+                continue;
+            }
+            let payload = &mut buf[..len];
+            dec.apply(payload);
+            if let Some(enc) = enc.as_mut() {
+                enc.apply(payload);
+            }
+            write_all(upstream, payload)
+                .await
+                .map_err(on(ClosedBy::Dc))?;
+            traffic.account(Direction::Up, len)
         };
-        activity.fetch_add(1, Ordering::Relaxed);
-        let len = records
-            .unwrap_in_place(&mut buf, n)
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-        if len == 0 {
-            continue;
+        // The buffer is back in the pool before a throttled session waits.
+        if let Some(wait) = wait {
+            traffic.throttle(wait).await;
         }
-        let payload = &mut buf[..len];
-        dec.apply(payload);
-        if let Some(enc) = enc.as_mut() {
-            enc.apply(payload);
-        }
-        write_all(upstream, payload).await?;
     }
 }
 
@@ -79,30 +125,40 @@ async fn upstream_to_client(
     mut dec: Option<Box<AesCtr>>,
     mut enc: Option<Box<AesCtr>>,
     activity: &AtomicU64,
-) -> io::Result<()> {
+    traffic: &SessionTraffic<'_>,
+) -> DirectionResult {
     loop {
-        upstream.readable().await?;
-        let mut buf = pool::take();
-        // The payload is read behind room for the record header, so header and
-        // payload leave in one write without copying the payload. One read
-        // takes everything the kernel has, up to a full record, which is what
-        // merges small upstream segments into large records under load.
-        let n = match upstream.try_read(&mut buf[RECORD_HEADER_LEN..]) {
-            Ok(0) => return Ok(()),
-            Ok(n) => n,
-            Err(err) if err.kind() == io::ErrorKind::WouldBlock => continue,
-            Err(err) => return Err(err),
+        upstream.readable().await.map_err(on(ClosedBy::Dc))?;
+        let wait = {
+            let mut buf = pool::take();
+            // The payload is read behind room for the record header, so header
+            // and payload leave in one write without copying the payload. One
+            // read takes everything the kernel has, up to a full record, which
+            // is what merges small upstream segments into large records under
+            // load.
+            let n = match upstream.try_read(&mut buf[RECORD_HEADER_LEN..]) {
+                Ok(0) => return Ok(()),
+                Ok(n) => n,
+                Err(err) if err.kind() == io::ErrorKind::WouldBlock => continue,
+                Err(err) => return Err((ClosedBy::Dc, err)),
+            };
+            activity.fetch_add(1, Ordering::Relaxed);
+            let payload = &mut buf[RECORD_HEADER_LEN..RECORD_HEADER_LEN + n];
+            if let Some(dec) = dec.as_mut() {
+                dec.apply(payload);
+            }
+            if let Some(enc) = enc.as_mut() {
+                enc.apply(payload);
+            }
+            buf[..RECORD_HEADER_LEN].copy_from_slice(&record_header(n));
+            write_all(client, &buf[..RECORD_HEADER_LEN + n])
+                .await
+                .map_err(on(ClosedBy::Client))?;
+            traffic.account(Direction::Down, RECORD_HEADER_LEN + n)
         };
-        activity.fetch_add(1, Ordering::Relaxed);
-        let payload = &mut buf[RECORD_HEADER_LEN..RECORD_HEADER_LEN + n];
-        if let Some(dec) = dec.as_mut() {
-            dec.apply(payload);
+        if let Some(wait) = wait {
+            traffic.throttle(wait).await;
         }
-        if let Some(enc) = enc.as_mut() {
-            enc.apply(payload);
-        }
-        buf[..RECORD_HEADER_LEN].copy_from_slice(&record_header(n));
-        write_all(client, &buf[..RECORD_HEADER_LEN + n]).await?;
     }
 }
 
@@ -135,17 +191,19 @@ async fn idle_watch(activity: &AtomicU64, idle: Option<Duration>) {
 /// framing state left over from the handshake.
 ///
 /// Buffers come from the pool and are held only from a successful read until
-/// the write it feeds has finished.
+/// the write it feeds has finished. `traffic` counts the bytes and, for a
+/// limited media session, says when to wait before the next read.
 pub async fn relay(
     client: &TcpStream,
     upstream: &TcpStream,
     records: RecordReader,
     ciphers: Ciphers,
     idle: Option<Duration>,
-) -> io::Result<()> {
+    traffic: &SessionTraffic<'_>,
+) -> Ended {
     const _: () = assert!(pool::BUF_LEN == RECORD_HEADER_LEN + MAX_RECORD_PAYLOAD);
     let activity = AtomicU64::new(0);
-    tokio::select! {
+    let (clean, result) = tokio::select! {
         result = client_to_upstream(
             client,
             upstream,
@@ -153,25 +211,37 @@ pub async fn relay(
             ciphers.client_dec,
             ciphers.upstream_enc,
             &activity,
-        ) => result,
+            traffic,
+        ) => (ClosedBy::Client, result),
         result = upstream_to_client(
             upstream,
             client,
             ciphers.upstream_dec,
             ciphers.client_enc,
             &activity,
-        ) => result,
-        () = idle_watch(&activity, idle) => {
-            Err(io::Error::new(io::ErrorKind::TimedOut, "session idle"))
-        }
+            traffic,
+        ) => (ClosedBy::Dc, result),
+        () = idle_watch(&activity, idle) => (ClosedBy::Idle, Ok(())),
+    };
+    match result {
+        Ok(()) => Ended {
+            by: clean,
+            error: None,
+        },
+        Err((by, error)) => Ended {
+            by,
+            error: Some(error),
+        },
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::limit::{Lane, Limits};
     use crate::tls::wrap_records;
     use proptest::prelude::*;
+    use std::sync::Arc;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
 
@@ -214,22 +284,35 @@ mod tests {
         }
     }
 
+    /// Relay on the chat lane with no limits configured.
+    async fn relay_plain(
+        proxy_client: &TcpStream,
+        proxy_upstream: &TcpStream,
+        ciphers: Ciphers,
+        idle: Option<Duration>,
+    ) -> Ended {
+        let limits = Limits::unlimited();
+        let traffic = SessionTraffic::new(Lane::Chat, &limits, proxy_client);
+        relay(
+            proxy_client,
+            proxy_upstream,
+            RecordReader::new(),
+            ciphers,
+            idle,
+            &traffic,
+        )
+        .await
+    }
+
     fn spawn_relay(
         proxy_client: TcpStream,
         proxy_upstream: TcpStream,
         ciphers: Ciphers,
         idle: Option<Duration>,
-    ) -> tokio::task::JoinHandle<io::Result<()>> {
-        tokio::spawn(async move {
-            relay(
-                &proxy_client,
-                &proxy_upstream,
-                RecordReader::new(),
-                ciphers,
-                idle,
-            )
-            .await
-        })
+    ) -> tokio::task::JoinHandle<Ended> {
+        tokio::spawn(
+            async move { relay_plain(&proxy_client, &proxy_upstream, ciphers, idle).await },
+        )
     }
 
     /// Feeds `to_upstream` (client side, in the given chunk sizes) and
@@ -400,8 +483,9 @@ mod tests {
     async fn slow_reader_applies_backpressure_without_losing_data() {
         let mut w = wiring().await;
         let _task = spawn_relay(w.proxy_client, w.proxy_upstream, no_ciphers(), None);
-        // Far more than the socket buffers hold, while the client reads nothing.
-        let data: Vec<u8> = (0..8_000_000u32).map(|i| (i % 251) as u8).collect();
+        // Far more than four loopback socket buffers can hold even when the
+        // kernel grows them, while the client reads nothing.
+        let data: Vec<u8> = (0..48_000_000u32).map(|i| (i % 251) as u8).collect();
         let expected = data.clone();
         let mut upstream = w.upstream;
         let writer = tokio::spawn(async move {
@@ -428,15 +512,9 @@ mod tests {
     async fn bad_record_from_client_ends_the_relay() {
         let mut w = wiring().await;
         w.client.write_all(b"GET / HTTP/1.1\r\n\r\n").await.unwrap();
-        let result = relay(
-            &w.proxy_client,
-            &w.proxy_upstream,
-            RecordReader::new(),
-            no_ciphers(),
-            None,
-        )
-        .await;
-        assert_eq!(result.unwrap_err().kind(), io::ErrorKind::InvalidData);
+        let ended = relay_plain(&w.proxy_client, &w.proxy_upstream, no_ciphers(), None).await;
+        assert_eq!(ended.by, ClosedBy::Client);
+        assert_eq!(ended.error.unwrap().kind(), io::ErrorKind::InvalidData);
     }
 
     #[tokio::test]
@@ -449,15 +527,14 @@ mod tests {
                 (w.client, w.upstream)
             };
             drop(close);
-            let result = relay(
-                &w.proxy_client,
-                &w.proxy_upstream,
-                RecordReader::new(),
-                no_ciphers(),
-                None,
-            )
-            .await;
-            assert!(result.is_ok());
+            let ended = relay_plain(&w.proxy_client, &w.proxy_upstream, no_ciphers(), None).await;
+            assert!(ended.error.is_none(), "{:?}", ended.error);
+            let expected = if close_client {
+                ClosedBy::Client
+            } else {
+                ClosedBy::Dc
+            };
+            assert_eq!(ended.by, expected);
             drop(keep);
         }
     }
@@ -467,15 +544,9 @@ mod tests {
         const IDLE: Duration = Duration::from_millis(400);
         let w = wiring().await;
         let start = std::time::Instant::now();
-        let result = relay(
-            &w.proxy_client,
-            &w.proxy_upstream,
-            RecordReader::new(),
-            no_ciphers(),
-            Some(IDLE),
-        )
-        .await;
-        assert_eq!(result.unwrap_err().kind(), io::ErrorKind::TimedOut);
+        let ended = relay_plain(&w.proxy_client, &w.proxy_upstream, no_ciphers(), Some(IDLE)).await;
+        assert_eq!(ended.by, ClosedBy::Idle);
+        assert!(ended.error.is_none());
         let elapsed = start.elapsed();
         // Upper bound is 5/4 of the timeout plus scheduling slack.
         assert!(
@@ -509,8 +580,8 @@ mod tests {
                 }
             }
             let last_byte = std::time::Instant::now();
-            let result = task.await.unwrap();
-            assert_eq!(result.unwrap_err().kind(), io::ErrorKind::TimedOut);
+            let ended = task.await.unwrap();
+            assert_eq!(ended.by, ClosedBy::Idle);
             let quiet = last_byte.elapsed();
             assert!(
                 quiet >= IDLE * 9 / 10 && quiet <= IDLE * 5 / 4 + IDLE / 2,
@@ -556,17 +627,147 @@ mod tests {
     #[tokio::test]
     async fn relay_state_is_small() {
         let w = wiring().await;
+        let limits = Limits::unlimited();
+        let traffic = SessionTraffic::new(Lane::Media, &limits, &w.proxy_client);
         let fut = relay(
             &w.proxy_client,
             &w.proxy_upstream,
             RecordReader::new(),
             no_ciphers(),
             Some(Duration::from_secs(900)),
+            &traffic,
         );
         let size = std::mem::size_of_val(&fut);
         // No buffers and no cipher state inline: pointers, a timer and the
         // readiness waiters of both sockets (about 1 KiB today).
         assert!(size <= 1280, "relay future is {size} bytes");
+    }
+
+    /// Downloads `len` bytes through a relay on `lane`. Returns how long that
+    /// took, the bytes written to the client, and whether the session was
+    /// ever made to wait (waiting is what turns pacing on).
+    async fn timed_download(limits: Arc<Limits>, lane: Lane, len: usize) -> (Duration, u64, bool) {
+        let mut w = wiring().await;
+        let (proxy_client, proxy_upstream) = (w.proxy_client, w.proxy_upstream);
+        let task = tokio::spawn(async move {
+            let traffic = SessionTraffic::new(lane, &limits, &proxy_client);
+            relay(
+                &proxy_client,
+                &proxy_upstream,
+                RecordReader::new(),
+                no_ciphers(),
+                None,
+                &traffic,
+            )
+            .await;
+            (
+                traffic.bytes_down.load(Ordering::Relaxed),
+                traffic.is_paced(),
+            )
+        });
+        let data: Vec<u8> = (0..len).map(|i| (i % 249) as u8).collect();
+        let expected = data.clone();
+        let mut upstream = w.upstream;
+        let writer = tokio::spawn(async move {
+            upstream.write_all(&data).await.unwrap();
+            upstream
+        });
+
+        let start = std::time::Instant::now();
+        let mut got = Vec::with_capacity(len);
+        let mut reader = RecordReader::new();
+        let mut buf = vec![0u8; 64 * 1024];
+        while got.len() < len {
+            let n = w.client.read(&mut buf).await.unwrap();
+            assert_ne!(n, 0);
+            let m = reader.unwrap_in_place(&mut buf, n).unwrap();
+            got.extend_from_slice(&buf[..m]);
+        }
+        let took = start.elapsed();
+        assert!(got == expected, "throttling changed the data");
+        drop(writer.await.unwrap());
+        drop(w.client);
+        let (down, waited) = task.await.unwrap();
+        (took, down, waited)
+    }
+
+    // These tests assert on whether a session was made to wait and on lower
+    // bounds of elapsed time. Upper bounds would depend on machine load.
+
+    #[tokio::test]
+    async fn media_is_held_to_the_rate_after_its_burst_and_chat_is_not() {
+        // 8 Mbit/s (1 MB/s) with a 200 kB burst; 1 MB of data.
+        let limits = Arc::new(Limits::new(8_000_000, 200_000, 0, 0.0));
+        let (media, media_down, media_waited) =
+            timed_download(limits.clone(), Lane::Media, 1_000_000).await;
+        // 800 kB beyond the burst at 1 MB/s is 0.8 s. The last read is sent
+        // before its own wait, so slightly less is observed.
+        assert!(media_waited);
+        assert!(media >= Duration::from_millis(650), "{media:?}");
+        assert!(media_down >= 1_000_000);
+        assert_eq!(limits.throttled_now(), 0);
+
+        let (chat, _, chat_waited) = timed_download(limits.clone(), Lane::Chat, 1_000_000).await;
+        assert!(!chat_waited, "chat was made to wait");
+        assert!(chat < media, "chat {chat:?}, media {media:?}");
+        // Payload plus record headers, whose number depends on read sizes.
+        assert!(limits.bytes(Lane::Chat) >= 1_000_000);
+        assert!(limits.bytes(Lane::Media) >= 1_000_000);
+    }
+
+    #[tokio::test]
+    async fn media_within_its_burst_is_not_delayed() {
+        let limits = Arc::new(Limits::new(8_000_000, 2_000_000, 0, 0.0));
+        let (_, _, waited) = timed_download(limits, Lane::Media, 1_000_000).await;
+        assert!(!waited);
+    }
+
+    #[tokio::test]
+    async fn congestion_scale_slows_media_further() {
+        let limits = Arc::new(Limits::new(8_000_000, 0, 1_000, 1.0));
+        // Put the link far over capacity so the scale drops to its floor.
+        limits.tick(Duration::from_secs(1));
+        let (_, _, chat_waited) = timed_download(limits.clone(), Lane::Chat, 100_000).await;
+        assert!(!chat_waited, "congestion control touched chat");
+        limits.tick(Duration::from_millis(100));
+        assert!(limits.scale() < 0.06, "{}", limits.scale());
+        // 50 kB/s effective: 40 kB takes about 0.8 s instead of 0.04 s.
+        let (took, _, waited) = timed_download(limits, Lane::Media, 40_000).await;
+        assert!(waited);
+        assert!(took >= Duration::from_millis(350), "{took:?}");
+    }
+
+    #[tokio::test]
+    async fn byte_counts_cover_both_directions() {
+        let mut w = wiring().await;
+        let limits = Limits::unlimited();
+        let (proxy_client, proxy_upstream) = (w.proxy_client, w.proxy_upstream);
+        let traffic = SessionTraffic::new(Lane::Chat, &limits, &proxy_client);
+        let relaying = relay(
+            &proxy_client,
+            &proxy_upstream,
+            RecordReader::new(),
+            no_ciphers(),
+            None,
+            &traffic,
+        );
+        let drive = async {
+            let mut framed = Vec::new();
+            wrap_records(&[1u8; 3000], &mut framed);
+            w.client.write_all(&framed).await.unwrap();
+            let mut sink = vec![0u8; 3000];
+            w.upstream.read_exact(&mut sink).await.unwrap();
+            w.upstream.write_all(&[2u8; 500]).await.unwrap();
+            let mut record = vec![0u8; 505];
+            w.client.read_exact(&mut record).await.unwrap();
+            drop(w.upstream);
+        };
+        let (ended, ()) = tokio::join!(relaying, drive);
+        assert_eq!(ended.by, ClosedBy::Dc);
+        assert_eq!(traffic.bytes_up.load(Ordering::Relaxed), 3000);
+        // Downstream counts what was written to the client: payload plus header.
+        assert_eq!(traffic.bytes_down.load(Ordering::Relaxed), 505);
+        assert_eq!(limits.bytes(Lane::Chat), 3505);
     }
 
     proptest! {

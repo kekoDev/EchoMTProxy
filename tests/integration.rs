@@ -967,3 +967,89 @@ async fn mask_site_reset_reaches_the_client_as_a_reset() {
     }
     assert_eq!(stats.mask(reset, MaskResult::Forwarded), 10);
 }
+
+#[tokio::test]
+async fn chat_is_unaffected_while_media_is_throttled() {
+    let dc = spawn_echo_dc(true).await;
+    // 800 kbit/s (100 kB/s) per media connection after a 50 kB burst.
+    let (proxy, handle) = spawn_proxy_handle(&format!(
+        "secrets = [\"{SECRET_HEX}\"]\n\
+         media_rate_bps = 800000\n\
+         media_burst_bytes = 50000\n\
+         metrics_listen = \"\"\n\
+         [dc_override]\n\
+         {DC} = \"{dc}\"\n"
+    ))
+    .await;
+    let limits = &handle.stats().limits;
+
+    // The same 200 kB echo on both lanes at the same time. Each byte crosses
+    // the proxy twice, so the media session is charged 400 kB: 350 kB beyond
+    // its burst, which takes 3.5 s at 100 kB/s.
+    let payload = random_bytes(200_000);
+    let media = Client::connect(proxy, -DC).await;
+    let chat = Client::connect(proxy, DC).await;
+    let timed = |mut client: Client, data: Vec<u8>| async move {
+        let start = std::time::Instant::now();
+        let echoed = client.echo(&data).await;
+        assert!(echoed == data, "data changed in transit");
+        (start.elapsed(), client)
+    };
+    let media_task = tokio::spawn(timed(media, payload.clone()));
+    let (chat_took, mut chat) = timed(chat, payload.clone()).await;
+
+    // The chat session can do a second round while media is still waiting.
+    let start = std::time::Instant::now();
+    assert!(chat.echo(&payload).await == payload);
+    let chat_again = start.elapsed();
+    assert!(
+        !media_task.is_finished(),
+        "media finished before two chat rounds: it was not throttled"
+    );
+    assert!(limits.throttled_now() >= 1, "no media session is waiting");
+
+    let (media_took, media) = media_task.await.unwrap();
+    assert!(
+        media_took >= Duration::from_millis(2800) && media_took < Duration::from_secs(10),
+        "media took {media_took:?}"
+    );
+    // Chat is bounded by this machine's speed only, far below media's time.
+    assert!(
+        chat_took * 3 < media_took && chat_again * 3 < media_took,
+        "chat {chat_took:?} and {chat_again:?}, media {media_took:?}"
+    );
+
+    assert!(limits.bytes(echo_mtproxy::limit::Lane::Media) >= 400_000);
+    assert!(limits.bytes(echo_mtproxy::limit::Lane::Chat) >= 800_000);
+    drop((media, chat));
+    for _ in 0..100 {
+        if limits.throttled_now() == 0 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(limits.throttled_now(), 0);
+}
+
+#[tokio::test]
+async fn media_is_not_limited_when_the_rate_is_zero() {
+    let dc = spawn_echo_dc(true).await;
+    let (proxy, handle) = spawn_proxy_handle(&format!(
+        "secrets = [\"{SECRET_HEX}\"]\n\
+         media_rate_bps = 0\n\
+         media_burst_bytes = 0\n\
+         metrics_listen = \"\"\n\
+         [dc_override]\n\
+         {DC} = \"{dc}\"\n"
+    ))
+    .await;
+    assert!(!handle.stats().limits.media_limited());
+    // With no burst, any limiting at all would stall this for minutes.
+    let mut media = Client::connect(proxy, -DC).await;
+    let payload = random_bytes(300_000);
+    let echoed = timeout(Duration::from_secs(20), media.echo(&payload))
+        .await
+        .expect("media was throttled although the rate is 0");
+    assert!(echoed == payload);
+    assert_eq!(handle.stats().limits.throttled_now(), 0);
+}
