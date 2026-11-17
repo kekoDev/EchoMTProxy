@@ -135,6 +135,7 @@ pub struct Stats {
     counters: Vec<LabelCounters>,
     connections_open: AtomicU64,
     connections_over_limit: AtomicU64,
+    connections_accepted: AtomicU64,
 }
 
 /// Keeps a client connection counted as open until dropped.
@@ -187,12 +188,14 @@ impl Stats {
             counters,
             connections_open: AtomicU64::new(0),
             connections_over_limit: AtomicU64::new(0),
+            connections_accepted: AtomicU64::new(0),
         }
     }
 
     /// Counts a new client connection, unless `max` are already open. A
     /// refused connection is counted as over the limit instead.
     pub fn admit_connection(self: &Arc<Self>, max: u64) -> Option<OpenConnection> {
+        self.connections_accepted.fetch_add(1, Ordering::Relaxed);
         if self.connections_open.fetch_add(1, Ordering::Relaxed) >= max {
             self.connections_open.fetch_sub(1, Ordering::Relaxed);
             self.connections_over_limit.fetch_add(1, Ordering::Relaxed);
@@ -205,6 +208,11 @@ impl Stats {
 
     pub fn connections_open(&self) -> u64 {
         self.connections_open.load(Ordering::Relaxed)
+    }
+
+    /// Every connection taken off a listener, admitted or not.
+    pub fn connections_accepted(&self) -> u64 {
+        self.connections_accepted.load(Ordering::Relaxed)
     }
 
     pub fn connections_over_limit(&self) -> u64 {
@@ -288,11 +296,16 @@ impl Stats {
              including handshaking and masked ones.\n\
              # TYPE echo_mtproxy_connections_open gauge\n\
              echo_mtproxy_connections_open {}\n\
+             # HELP echo_mtproxy_connections_accepted_total Connections taken off the \
+             listeners, admitted or not.\n\
+             # TYPE echo_mtproxy_connections_accepted_total counter\n\
+             echo_mtproxy_connections_accepted_total {}\n\
              # HELP echo_mtproxy_connections_over_limit_total Connections refused because \
              max_connections were open.\n\
              # TYPE echo_mtproxy_connections_over_limit_total counter\n\
              echo_mtproxy_connections_over_limit_total {}",
             self.connections_open(),
+            self.connections_accepted(),
             self.connections_over_limit()
         )?;
         out.push_str(
@@ -555,6 +568,8 @@ mod tests {
         let text = stats.render();
         assert!(text.contains("\necho_mtproxy_connections_open 0\n"));
         assert!(text.contains("\necho_mtproxy_connections_over_limit_total 4\n"));
+        assert!(text.contains("\necho_mtproxy_connections_accepted_total 7\n"));
+        assert_eq!(stats.connections_accepted(), 7);
     }
 
     #[test]

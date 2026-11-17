@@ -49,6 +49,7 @@ pub async fn spawn_echo_dc(obfuscated: bool) -> SocketAddr {
 }
 
 pub async fn echo_dc_session(mut stream: TcpStream, obfuscated: bool) -> std::io::Result<()> {
+    stream.set_nodelay(true)?;
     let mut ciphers = None;
     if obfuscated {
         let mut init = [0u8; 64];
@@ -218,6 +219,9 @@ impl Client {
 
     /// Runs the client side of both handshakes on an already connected socket.
     pub async fn handshake(mut stream: TcpStream, dc_idx: i16, sni: &str) -> Self {
+        // Without this, small back-to-back writes wait on the peer's delayed
+        // ACK and every handshake takes 40 ms on Linux.
+        stream.set_nodelay(true).unwrap();
         let secret = secret();
         let hello = signed_hello_for(sni, &secret.key, unix_now());
         stream.write_all(&hello).await.unwrap();
@@ -366,4 +370,63 @@ pub async fn connect_bulk(addr: SocketAddr) -> TcpStream {
     } else {
         TcpStream::connect(addr).await.unwrap()
     }
+}
+
+/// The real proxy binary running as a child process; killed on drop.
+pub struct ProxyProcess(pub std::process::Child);
+
+impl Drop for ProxyProcess {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+/// A port nobody is listening on right now.
+pub fn free_port() -> u16 {
+    let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    probe.local_addr().unwrap().port()
+}
+
+/// Starts the proxy binary with `config` and waits until `ready` accepts.
+pub async fn start_proxy_process(name: &str, config: &str, ready: SocketAddr) -> ProxyProcess {
+    let path: std::path::PathBuf = [
+        env!("CARGO_TARGET_TMPDIR"),
+        &format!("{name}-{}.toml", std::process::id()),
+    ]
+    .iter()
+    .collect();
+    std::fs::write(&path, config).unwrap();
+    let child = std::process::Command::new(env!("CARGO_BIN_EXE_echo-mtproxy"))
+        .arg("--config")
+        .arg(&path)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::inherit())
+        .env("RUST_LOG", "warn")
+        .spawn()
+        .expect("starting the proxy binary");
+    let proxy = ProxyProcess(child);
+    for _ in 0..200 {
+        if TcpStream::connect(ready).await.is_ok() {
+            let _ = std::fs::remove_file(&path);
+            return proxy;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    panic!("the proxy did not start listening on {ready}");
+}
+
+/// An echo DC on a specific loopback address.
+pub async fn spawn_echo_dc_on(ip: [u8; 4]) -> SocketAddr {
+    let listener = TcpListener::bind(SocketAddr::from((ip, 0))).await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        loop {
+            let (stream, _) = listener.accept().await.unwrap();
+            tokio::spawn(async move {
+                let _ = echo_dc_session(stream, true).await;
+            });
+        }
+    });
+    addr
 }
