@@ -5,15 +5,16 @@ use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use socket2::SockRef;
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
 use tokio::sync::Semaphore;
 
 use crate::config::{MaskDomain, MaskTarget};
+use crate::pool;
+use crate::relay::write_all;
 use crate::stats::MaskResult;
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
-const BUF_LEN: usize = 8192;
 
 /// Forwards connections that failed the handshake to a real TLS site, so the
 /// proxy answers probes the way that site would.
@@ -114,15 +115,14 @@ impl Masker {
     }
 
     /// Replays `seen` (everything read from the client so far) to the target
-    /// chosen by `sni` and splices the two connections until both directions
+    /// its SNI selects and splices the two connections until both directions
     /// are done. Returns the target's name with the outcome.
-    pub async fn forward(
-        &self,
-        client: &mut TcpStream,
-        seen: &[u8],
-        sni: Option<&str>,
-    ) -> (&str, MaskResult) {
-        let index = self.select_index(sni);
+    ///
+    /// `seen` is taken by value and freed once it has been replayed, and the
+    /// splice borrows pool buffers only while bytes are in flight, so a quiet
+    /// masked connection holds neither.
+    pub async fn forward(&self, client: &TcpStream, seen: Vec<u8>) -> (&str, MaskResult) {
+        let index = self.select_index(crate::tls::client_hello_sni(&seen));
         let name = self.targets[index].domain.as_str();
         let Ok(_permit) = self.permits.try_acquire() else {
             return (name, MaskResult::Limited);
@@ -134,41 +134,48 @@ impl Masker {
                 return (name, MaskResult::ConnectFailed);
             }
         };
-        if server.write_all(seen).await.is_err() {
+        if server.write_all(&seen).await.is_err() {
             return (name, MaskResult::ConnectFailed);
         }
+        drop(seen);
 
-        let result = {
-            let (client_read, client_write) = client.split();
-            let (server_read, server_write) = server.split();
-            tokio::try_join!(
-                pipe(client_read, server_write, self.idle_timeout),
-                pipe(server_read, client_write, self.idle_timeout)
-            )
-        };
+        let result = tokio::try_join!(
+            pipe(client, &server, self.idle_timeout),
+            pipe(&server, client, self.idle_timeout)
+        );
         if matches!(&result, Err(err) if err.kind() == io::ErrorKind::ConnectionReset) {
             // Pass a reset on as a reset rather than a clean close.
-            let _ = SockRef::from(&*client).set_linger(Some(Duration::ZERO));
+            let _ = SockRef::from(client).set_linger(Some(Duration::ZERO));
         }
         (name, MaskResult::Forwarded)
     }
 }
 
-async fn pipe<R, W>(mut from: R, mut to: W, idle: Duration) -> io::Result<()>
-where
-    R: AsyncRead + Unpin,
-    W: AsyncWrite + Unpin,
-{
-    let mut buf = vec![0u8; BUF_LEN];
+fn idle_error() -> io::Error {
+    io::Error::new(io::ErrorKind::TimedOut, "mask connection idle")
+}
+
+/// Copies one direction until EOF, which is passed on as a write shutdown.
+/// Fails if the source stays silent, or the sink stays blocked, for `idle`.
+async fn pipe(from: &TcpStream, to: &TcpStream, idle: Duration) -> io::Result<()> {
     loop {
-        let n = tokio::time::timeout(idle, from.read(&mut buf))
+        // Quiet connections wait here without a buffer.
+        tokio::time::timeout(idle, from.readable())
             .await
-            .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "mask connection idle"))??;
-        if n == 0 {
-            let _ = to.shutdown().await;
-            return Ok(());
-        }
-        to.write_all(&buf[..n]).await?;
+            .map_err(|_| idle_error())??;
+        let mut buf = pool::take();
+        let n = match from.try_read(&mut buf) {
+            Ok(0) => {
+                let _ = SockRef::from(to).shutdown(std::net::Shutdown::Write);
+                return Ok(());
+            }
+            Ok(n) => n,
+            Err(err) if err.kind() == io::ErrorKind::WouldBlock => continue,
+            Err(err) => return Err(err),
+        };
+        tokio::time::timeout(idle, write_all(to, &buf[..n]))
+            .await
+            .map_err(|_| idle_error())??;
     }
 }
 
@@ -294,36 +301,93 @@ mod tests {
         assert_eq!(resolve_default(&masker).await, real);
     }
 
-    #[tokio::test(start_paused = true)]
+    async fn socket_pair() -> (TcpStream, TcpStream) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (near, far) = tokio::join!(TcpStream::connect(addr), listener.accept());
+        (near.unwrap(), far.unwrap().0)
+    }
+
+    /// `source -> [from | pipe | to] -> sink`
+    async fn piped(
+        idle: Duration,
+    ) -> (
+        TcpStream,
+        TcpStream,
+        tokio::task::JoinHandle<io::Result<()>>,
+    ) {
+        let (source, from) = socket_pair().await;
+        let (to, sink) = socket_pair().await;
+        let task = tokio::spawn(async move { pipe(&from, &to, idle).await });
+        (source, sink, task)
+    }
+
+    #[tokio::test]
     async fn pipe_times_out_only_when_idle() {
-        const IDLE: Duration = Duration::from_secs(120);
-        let (mut near, far) = tokio::io::duplex(64);
-        let (mut sink_reader, sink) = tokio::io::duplex(64);
-        let task = tokio::spawn(pipe(far, sink, IDLE));
+        use tokio::io::AsyncReadExt;
+        const IDLE: Duration = Duration::from_millis(400);
+        let (mut source, mut sink, task) = piped(IDLE).await;
 
         let mut byte = [0u8; 1];
         for _ in 0..5 {
-            tokio::time::sleep(Duration::from_secs(100)).await;
-            near.write_all(b"x").await.unwrap();
-            sink_reader.read_exact(&mut byte).await.unwrap();
+            tokio::time::sleep(IDLE * 3 / 4).await;
+            source.write_all(b"x").await.unwrap();
+            sink.read_exact(&mut byte).await.unwrap();
             assert!(!task.is_finished());
         }
-        let start = tokio::time::Instant::now();
+        let start = Instant::now();
         let err = task.await.unwrap().unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::TimedOut);
-        assert_eq!(start.elapsed(), IDLE);
+        let quiet = start.elapsed();
+        assert!(quiet >= IDLE * 9 / 10 && quiet < IDLE * 2, "{quiet:?}");
     }
 
     #[tokio::test]
     async fn pipe_forwards_eof_as_shutdown() {
-        let (mut near, far) = tokio::io::duplex(64);
-        let (mut sink_reader, sink) = tokio::io::duplex(64);
-        let task = tokio::spawn(pipe(far, sink, Duration::from_secs(5)));
-        near.write_all(b"bye").await.unwrap();
-        near.shutdown().await.unwrap();
+        use tokio::io::AsyncReadExt;
+        let (mut source, mut sink, task) = piped(Duration::from_secs(5)).await;
+        source.write_all(b"bye").await.unwrap();
+        source.shutdown().await.unwrap();
         let mut out = Vec::new();
-        sink_reader.read_to_end(&mut out).await.unwrap();
+        sink.read_to_end(&mut out).await.unwrap();
         assert_eq!(out, b"bye");
         task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn pipe_carries_large_transfers_through_backpressure() {
+        use tokio::io::AsyncReadExt;
+        let (mut source, mut sink, task) = piped(Duration::from_secs(5)).await;
+        let data: Vec<u8> = (0..4_000_000u32).map(|i| (i % 253) as u8).collect();
+        let expected = data.clone();
+        let writer = tokio::spawn(async move {
+            source.write_all(&data).await.unwrap();
+            source.shutdown().await.unwrap();
+        });
+        // Let the pipe fill the sink's socket buffer before anyone reads.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let mut out = Vec::with_capacity(expected.len());
+        sink.read_to_end(&mut out).await.unwrap();
+        assert!(out == expected);
+        writer.await.unwrap();
+        task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn blocked_sink_counts_as_idle() {
+        // The source keeps sending but the sink never reads: once the sink's
+        // buffers are full the pipe is stuck in a write, and must give up.
+        let (mut source, _sink, task) = piped(Duration::from_millis(300)).await;
+        let feeder = tokio::spawn(async move {
+            let chunk = vec![0u8; 64 * 1024];
+            while source.write_all(&chunk).await.is_ok() {}
+        });
+        let err = tokio::time::timeout(Duration::from_secs(20), task)
+            .await
+            .expect("pipe never gave up on a blocked sink")
+            .unwrap()
+            .unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::TimedOut);
+        feeder.abort();
     }
 }

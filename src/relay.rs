@@ -25,7 +25,8 @@ pub struct Ciphers {
     pub client_enc: Option<Box<AesCtr>>,
 }
 
-async fn write_all(stream: &TcpStream, mut data: &[u8]) -> io::Result<()> {
+/// Writes all of `data`, waiting for writability only when the socket is full.
+pub(crate) async fn write_all(stream: &TcpStream, mut data: &[u8]) -> io::Result<()> {
     while !data.is_empty() {
         // Try first: the socket is usually writable and this saves a wake-up.
         match stream.try_write(data) {

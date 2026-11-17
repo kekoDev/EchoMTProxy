@@ -9,7 +9,9 @@
 //!     cargo test --release --test heap_profile -- --ignored --nocapture
 //! ```
 //!
-//! `HEAP_SESSIONS` (default 10000) sets the number of sessions.
+//! `HEAP_SESSIONS` (default 10000) sets the number of sessions. dhat allows one
+//! profiler per process, so run one test at a time by name, for example
+//! `-- --ignored --nocapture masked_connection_heap_profile`.
 #![cfg(unix)]
 
 mod common;
@@ -91,7 +93,7 @@ fn classify(frames: &[&str]) -> Option<String> {
     })
 }
 
-fn report(profile: &Value, sessions: usize) {
+fn report(what: &str, profile: &Value, sessions: usize) {
     let frames: Vec<&str> = profile["ftbl"]
         .as_array()
         .unwrap()
@@ -124,7 +126,7 @@ fn report(profile: &Value, sessions: usize) {
     let mut rows: Vec<_> = sites.into_iter().collect();
     rows.sort_by_key(|row| std::cmp::Reverse(row.1 .0));
     let total: u64 = rows.iter().map(|r| r.1 .0).sum();
-    println!("live proxy heap with {sessions} idle sessions");
+    println!("live proxy heap with {sessions} {what}");
     println!("{:>12} {:>10} {:>10}  site", "bytes", "blocks", "B/session");
     for (label, (bytes, blocks)) in &rows {
         if bytes / sessions as u64 == 0 && *bytes < 64 * 1024 {
@@ -199,9 +201,77 @@ async fn idle_session_heap_profile() {
     drop(profiler);
     let text = std::fs::read_to_string(&output).expect("reading the dhat profile");
     report(
+        "idle sessions",
         &serde_json::from_str(&text).expect("parsing the dhat profile"),
         sessions,
     );
     println!("full profile: {}", output.display());
     drop(clients);
+}
+
+/// Same measurement for connections that failed the handshake and are being
+/// forwarded to a mask site that has gone quiet.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "heavy: profiles masked connections under dhat"]
+async fn masked_connection_heap_profile() {
+    use echo_mtproxy::stats::HandshakeResult;
+    use tokio::io::AsyncWriteExt;
+
+    let connections: usize = std::env::var("HEAP_SESSIONS")
+        .ok()
+        .map(|v| v.parse().expect("HEAP_SESSIONS must be a number"))
+        .unwrap_or(2_000);
+    let needed = connections as u64 * 4 + 512;
+    let limit = raise_fd_limit(needed);
+    assert!(
+        limit >= needed,
+        "need {needed} file descriptors, limit is {limit}"
+    );
+
+    let output: PathBuf = [env!("CARGO_TARGET_TMPDIR"), "dhat-masked.json"]
+        .iter()
+        .collect();
+    let profiler = dhat::Profiler::builder().file_name(&output).build();
+
+    // The mask site accepts, reads nothing and never answers.
+    let site = spawn_blackhole().await;
+    let (proxy, handle) = spawn_proxy_handle(&format!(
+        "secrets = [\"{SECRET_HEX}\"]\n\
+         mask_host = \"{site}\"\n\
+         mask_max_connections = {}\n\
+         mask_idle_timeout_secs = 3600\n\
+         metrics_listen = \"\"\n",
+        connections + 100
+    ))
+    .await;
+
+    let hello = signed_hello(&[0x42; 16], unix_now());
+    let mut held = Vec::with_capacity(connections);
+    for _ in 0..connections {
+        let mut stream = connect_bulk(proxy).await;
+        stream.write_all(&hello).await.unwrap();
+        held.push(stream);
+    }
+    let stats = handle.stats();
+    let label = stats.label_index(Some("www.example.com"));
+    for _ in 0..500 {
+        if stats.handshakes(label, HandshakeResult::BadDigest) == connections as u64 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    assert_eq!(
+        stats.handshakes(label, HandshakeResult::BadDigest),
+        connections as u64
+    );
+    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+
+    drop(profiler);
+    let text = std::fs::read_to_string(&output).expect("reading the dhat profile");
+    report(
+        "masked connections",
+        &serde_json::from_str(&text).expect("parsing the dhat profile"),
+        connections,
+    );
+    drop(held);
 }

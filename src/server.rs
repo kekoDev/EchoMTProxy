@@ -403,8 +403,7 @@ pub async fn handle_client(mut stream: TcpStream, proxy: Arc<Proxy>) {
             }
         }
         Next::Mask(bytes) => {
-            let sni = tls::client_hello_sni(&bytes);
-            let (target, result) = Box::pin(proxy.masker.forward(&mut stream, &bytes, sni)).await;
+            let (target, result) = Box::pin(proxy.masker.forward(&stream, bytes)).await;
             let stats = &proxy.stats;
             stats.record_mask(stats.label_index(Some(target)), result);
             if result == MaskResult::Limited {
