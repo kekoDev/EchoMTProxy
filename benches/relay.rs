@@ -1,8 +1,8 @@
-//! Relay throughput per upstream mode over in-memory pipes.
+//! Relay throughput per upstream mode over loopback TCP.
 //!
-//! The harness side (framing, unframing, the pipes themselves) is included in
-//! the numbers, so compare modes and machines with each other rather than
-//! reading them as absolute proxy throughput.
+//! The harness side (framing, unframing, the kernel's loopback path) is
+//! included in the numbers, so compare modes, versions and machines with each
+//! other rather than reading them as absolute proxy throughput.
 
 use std::time::Duration;
 
@@ -10,10 +10,10 @@ use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Through
 use echo_mtproxy::cipher::AesCtr;
 use echo_mtproxy::relay::{relay, Ciphers};
 use echo_mtproxy::tls::{self, RecordReader};
-use tokio::io::{AsyncReadExt, AsyncWriteExt, DuplexStream};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::{TcpListener, TcpStream};
 
 const CHUNK: usize = 1 << 20;
-const PIPE: usize = 256 * 1024;
 
 fn cipher(seed: u8) -> AesCtr {
     AesCtr::new(&[seed; 32], &[seed.wrapping_add(1); 16])
@@ -42,12 +42,22 @@ fn ciphers(mode: &str) -> Ciphers {
     }
 }
 
+async fn socket_pair() -> (TcpStream, TcpStream) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (near, far) = tokio::join!(TcpStream::connect(addr), listener.accept());
+    let (near, far) = (near.unwrap(), far.unwrap().0);
+    near.set_nodelay(true).unwrap();
+    far.set_nodelay(true).unwrap();
+    (near, far)
+}
+
 /// A running relay with the client and DC ends held by the benchmark.
-fn start(runtime: &tokio::runtime::Runtime, mode: &str) -> (DuplexStream, DuplexStream) {
-    let (client, proxy_client) = tokio::io::duplex(PIPE);
-    let (upstream, proxy_upstream) = tokio::io::duplex(PIPE);
-    let (client_read, client_write) = tokio::io::split(proxy_client);
-    let (upstream_read, upstream_write) = tokio::io::split(proxy_upstream);
+fn start(runtime: &tokio::runtime::Runtime, mode: &str) -> (TcpStream, TcpStream) {
+    let ((client, proxy_client), (upstream, proxy_upstream)) =
+        runtime.block_on(async { (socket_pair().await, socket_pair().await) });
+    let (client_read, client_write) = proxy_client.into_split();
+    let (upstream_read, upstream_write) = proxy_upstream.into_split();
     runtime.spawn(relay(
         client_read,
         client_write,
@@ -60,7 +70,7 @@ fn start(runtime: &tokio::runtime::Runtime, mode: &str) -> (DuplexStream, Duplex
     (client, upstream)
 }
 
-async fn download(client: &mut DuplexStream, upstream: &mut DuplexStream, data: &[u8]) {
+async fn download(client: &mut TcpStream, upstream: &mut TcpStream, data: &[u8]) {
     let mut records = RecordReader::new();
     let mut buf = vec![0u8; 64 * 1024];
     let read = async {
@@ -74,7 +84,7 @@ async fn download(client: &mut DuplexStream, upstream: &mut DuplexStream, data: 
     written.unwrap();
 }
 
-async fn upload(client: &mut DuplexStream, upstream: &mut DuplexStream, framed: &[u8], len: usize) {
+async fn upload(client: &mut TcpStream, upstream: &mut TcpStream, framed: &[u8], len: usize) {
     let mut buf = vec![0u8; 64 * 1024];
     let read = async {
         let mut got = 0;
@@ -88,7 +98,7 @@ async fn upload(client: &mut DuplexStream, upstream: &mut DuplexStream, framed: 
 
 fn throughput(c: &mut Criterion) {
     let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_time()
+        .enable_all()
         .build()
         .unwrap();
     let data = vec![0x5au8; CHUNK];
