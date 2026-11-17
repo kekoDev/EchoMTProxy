@@ -435,6 +435,23 @@ pub async fn handle_client(mut stream: TcpStream, proxy: Arc<Proxy>) {
     }
 }
 
+/// How often egress is measured and the media scale adjusted.
+pub const CONGESTION_TICK: Duration = Duration::from_millis(200);
+
+/// Runs congestion control forever: measures relay egress every tick and
+/// scales media rates down while it exceeds the configured share of the link.
+pub async fn run_congestion_control(stats: Arc<Stats>) {
+    let mut ticker = tokio::time::interval(CONGESTION_TICK);
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut last = Instant::now();
+    loop {
+        ticker.tick().await;
+        let now = Instant::now();
+        stats.limits.tick(now.duration_since(last));
+        last = now;
+    }
+}
+
 /// Accepts connections forever, one task per connection.
 pub async fn serve(listener: TcpListener, proxy: Arc<Proxy>) {
     loop {

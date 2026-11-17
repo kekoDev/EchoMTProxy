@@ -9,7 +9,7 @@ use std::time::Duration;
 use common::*;
 use echo_mtproxy::cipher::Ctr;
 use echo_mtproxy::obfs2;
-use echo_mtproxy::server::Proxy;
+use echo_mtproxy::server::{self, Proxy};
 use echo_mtproxy::stats::{self, HandshakeResult, MaskResult};
 use echo_mtproxy::tls;
 use rand::{Rng, RngCore};
@@ -1052,4 +1052,84 @@ async fn media_is_not_limited_when_the_rate_is_zero() {
         .expect("media was throttled although the rate is 0");
     assert!(echoed == payload);
     assert_eq!(handle.stats().limits.throttled_now(), 0);
+}
+
+#[tokio::test]
+async fn congestion_scales_media_down_and_recovers() {
+    use echo_mtproxy::limit::Lane;
+
+    let dc = spawn_echo_dc(true).await;
+    // An 8 Mbit/s "link" with the threshold at half of it: 500 kB/s of relay
+    // egress. Media connections get 80 kB/s with no burst.
+    let (proxy, handle) = spawn_proxy_handle(&format!(
+        "secrets = [\"{SECRET_HEX}\"]\n\
+         link_capacity_bps = 8000000\n\
+         congestion_threshold = 0.5\n\
+         media_rate_bps = 640000\n\
+         media_burst_bytes = 0\n\
+         metrics_listen = \"\"\n\
+         [dc_override]\n\
+         {DC} = \"{dc}\"\n"
+    ))
+    .await;
+    let stats = handle.stats().clone();
+    tokio::spawn(server::run_congestion_control(stats.clone()));
+    let limits = &stats.limits;
+    assert_eq!(limits.scale(), 1.0);
+
+    // Chat traffic far above the threshold for a while.
+    let mut chat = Client::connect(proxy, DC).await;
+    let chunk = random_bytes(200_000);
+    let flood_until = std::time::Instant::now() + Duration::from_millis(1500);
+    let mut lowest: f64 = 1.0;
+    let mut peak_egress = 0;
+    let mut rounds = 0u32;
+    while std::time::Instant::now() < flood_until {
+        assert!(chat.echo(&chunk).await == chunk);
+        rounds += 1;
+        lowest = lowest.min(limits.scale());
+        peak_egress = peak_egress.max(limits.egress_bps());
+    }
+    // Chat itself was never slowed: it moved far more than the threshold allows.
+    let chat_rate = f64::from(rounds) * 400_000.0 / 1.5;
+    assert!(chat_rate > 1_000_000.0, "chat moved only {chat_rate} B/s");
+    assert!(
+        peak_egress > 4_000_000,
+        "measured egress {peak_egress} bit/s"
+    );
+    assert!(lowest < 0.5, "media scale only fell to {lowest}");
+    assert!(lowest >= 0.05);
+
+    // While congested, a media connection is slower than its configured rate:
+    // 20 kB echoed is 40 kB charged, 0.5 s at 80 kB/s, longer when scaled.
+    let keep_flooding = tokio::spawn(async move {
+        let until = std::time::Instant::now() + Duration::from_millis(1500);
+        while std::time::Instant::now() < until {
+            assert!(chat.echo(&chunk).await == chunk);
+        }
+        chat
+    });
+    let mut media = Client::connect(proxy, -DC).await;
+    let small = random_bytes(20_000);
+    let start = std::time::Instant::now();
+    assert!(media.echo(&small).await == small);
+    let congested = start.elapsed();
+    assert!(
+        congested > Duration::from_millis(700),
+        "media took only {congested:?}"
+    );
+    let _chat = keep_flooding.await.unwrap();
+
+    // With the link quiet the scale returns to 1 (10% per 200 ms tick).
+    let recover_by = std::time::Instant::now() + Duration::from_secs(15);
+    while limits.scale() < 1.0 {
+        assert!(
+            std::time::Instant::now() < recover_by,
+            "scale stuck at {}",
+            limits.scale()
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(limits.egress_bps() < 4_000_000);
+    assert!(limits.bytes(Lane::Chat) > limits.bytes(Lane::Media));
 }
