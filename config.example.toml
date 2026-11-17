@@ -39,11 +39,13 @@ time_skew_ahead_secs = 1200      # client clock may lead the proxy by this much
 # such a handshake can be replayed once it has aged out of the replay cache.
 accept_uptime_timestamps = true
 
-# Replay cache size per generation. Two generations are kept so every entry lives
-# for at least behind + ahead seconds. Each handshake stores 2 entries of 32 bytes;
-# memory is allocated as the table grows, 38-75 bytes per live entry, so the
-# worst case for the default is about 280 MB. If a generation fills up before the
-# window elapses, the oldest generation is dropped early and a warning is logged.
+# Replay cache size per generation, split over up to 64 shards. Two generations
+# are kept so every entry lives for at least behind + ahead seconds. Each
+# handshake stores 2 entries. The tables have a fixed size: 85.3 bytes per entry
+# configured here (32-byte slots, 4/3 slots per entry, two generations), so the
+# default reserves 171 MB at startup; pages become resident as they are used.
+# If a shard fills up before the window elapses it drops its older generation
+# early and a warning is logged.
 replay_cache_entries = 2000000
 
 handshake_timeout_secs = 10

@@ -1,47 +1,148 @@
-use std::collections::HashSet;
+use std::hash::{BuildHasher, RandomState};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 pub const KEY_LEN: usize = 32;
 
-struct Generations {
-    current: HashSet<[u8; KEY_LEN]>,
-    previous: HashSet<[u8; KEY_LEN]>,
+type Key = [u8; KEY_LEN];
+
+const EMPTY: Key = [0; KEY_LEN];
+/// Stands in for the all-zero key, which marks an empty slot.
+const ZERO_KEY_ALIAS: Key = [0xff; KEY_LEN];
+
+const MAX_SHARDS: usize = 64;
+/// Below this many entries per shard, fewer shards are used.
+const MIN_SHARD_ENTRIES: usize = 4096;
+/// Slots per entry of capacity: a table never fills beyond 3/4.
+const SLOTS_NUM: usize = 4;
+const SLOTS_DEN: usize = 3;
+const EARLY_ROTATION_LOG_INTERVAL_SECS: u64 = 60;
+
+/// Fixed-size open-addressing set. Never grows and never rehashes.
+struct Table {
+    slots: Box<[Key]>,
+    len: usize,
+}
+
+impl Table {
+    fn new(slot_count: usize) -> Self {
+        Self {
+            // Zeroed allocation: untouched pages cost nothing until used.
+            slots: vec![EMPTY; slot_count].into_boxed_slice(),
+            len: 0,
+        }
+    }
+
+    fn start(&self, hash: u64) -> usize {
+        // Multiply-shift maps the hash onto any table size without a division.
+        ((u128::from(hash) * self.slots.len() as u128) >> 64) as usize
+    }
+
+    fn contains(&self, key: &Key, hash: u64) -> bool {
+        if self.len == 0 {
+            return false;
+        }
+        let mut index = self.start(hash);
+        loop {
+            let slot = &self.slots[index];
+            if slot == key {
+                return true;
+            }
+            if *slot == EMPTY {
+                return false;
+            }
+            index = (index + 1) % self.slots.len();
+        }
+    }
+
+    /// The caller keeps `len` below the slot count, so an empty slot exists.
+    fn insert(&mut self, key: &Key, hash: u64) {
+        let mut index = self.start(hash);
+        while self.slots[index] != EMPTY {
+            index = (index + 1) % self.slots.len();
+        }
+        self.slots[index] = *key;
+        self.len += 1;
+    }
+
+    fn clear(&mut self) {
+        if self.len > 0 {
+            self.slots.fill(EMPTY);
+            self.len = 0;
+        }
+    }
+}
+
+struct Shard {
+    current: Table,
+    previous: Table,
     rotated_at: Instant,
 }
 
-/// Bounded anti-replay cache with two generations.
+impl Shard {
+    fn rotate(&mut self, now: Instant) {
+        std::mem::swap(&mut self.current, &mut self.previous);
+        self.current.clear();
+        self.rotated_at = now;
+    }
+}
+
+/// Sharded, fixed-size anti-replay cache with two generations per shard.
 ///
-/// Generations rotate every `window`, so an entry is remembered for at least
-/// `window` and at most twice that. `window` must cover the whole period a
-/// handshake stays valid (the clock-skew window).
+/// A shard's generations rotate every `window`, so an entry is remembered for
+/// at least `window` and at most twice that. `window` must cover the whole
+/// period a handshake stays valid (the clock-skew window).
 ///
-/// Memory: a 32-byte key plus one control byte per hash-table slot, 38-75
-/// bytes per live entry depending on table load, times two generations. The
-/// tables grow on demand, so an idle proxy pays nothing.
+/// Memory is fixed at construction: 32-byte slots, 4/3 slots per entry, two
+/// generations, i.e. 85.3 bytes per entry of `capacity` (42.7 per generation).
+/// The tables are allocated zeroed, so pages are only resident once touched.
 ///
-/// If a generation reaches `capacity` before `window` has passed, it rotates
-/// early. That drops the previous generation and shortens the guarantee, so it
-/// is counted and logged; raise the capacity if it happens.
+/// If a shard's current generation fills up before `window` has passed, that
+/// shard rotates early. This forgets its previous generation and shortens the
+/// guarantee for the keys in it, so it is counted and logged; raise the
+/// capacity if it happens.
+///
+/// Keys are placed with a per-process random hash, so someone holding a valid
+/// secret cannot aim keys at one shard or one probe run.
 pub struct ReplayCache {
-    generations: Mutex<Generations>,
+    shards: Box<[Mutex<Shard>]>,
+    hasher: RandomState,
     window: Duration,
-    capacity: usize,
+    shard_capacity: usize,
     early_rotations: AtomicU64,
+    last_warning_secs: AtomicU64,
+    created: Instant,
 }
 
 impl ReplayCache {
+    /// `capacity` is the number of entries one generation holds across all shards.
     pub fn new(window: Duration, capacity: usize) -> Self {
+        let capacity = capacity.max(1);
+        let shard_count = (capacity / MIN_SHARD_ENTRIES)
+            .clamp(1, MAX_SHARDS)
+            .next_power_of_two()
+            .min(MAX_SHARDS);
+        let shard_capacity = capacity.div_ceil(shard_count);
+        let slot_count = shard_capacity * SLOTS_NUM / SLOTS_DEN + 1;
+        let now = Instant::now();
+        let shards = (0..shard_count)
+            .map(|_| {
+                Mutex::new(Shard {
+                    current: Table::new(slot_count),
+                    previous: Table::new(slot_count),
+                    rotated_at: now,
+                })
+            })
+            .collect();
         Self {
-            generations: Mutex::new(Generations {
-                current: HashSet::new(),
-                previous: HashSet::new(),
-                rotated_at: Instant::now(),
-            }),
+            shards,
+            hasher: RandomState::new(),
             window,
-            capacity: capacity.max(1),
+            shard_capacity,
             early_rotations: AtomicU64::new(0),
+            last_warning_secs: AtomicU64::new(u64::MAX),
+            created: now,
         }
     }
 
@@ -54,53 +155,90 @@ impl ReplayCache {
         self.early_rotations.load(Ordering::Relaxed)
     }
 
+    pub fn shard_count(&self) -> usize {
+        self.shards.len()
+    }
+
+    /// Bytes of table memory, fixed for the lifetime of the cache.
+    pub fn memory_bytes(&self) -> usize {
+        self.shards
+            .iter()
+            .map(|shard| {
+                let shard = shard.lock().unwrap_or_else(|e| e.into_inner());
+                (shard.current.slots.len() + shard.previous.slots.len()) * KEY_LEN
+            })
+            .sum()
+    }
+
     fn check_and_insert_at(&self, key: &[u8; KEY_LEN], now: Instant) -> bool {
-        let mut guard = self
-            .generations
+        let key = if *key == EMPTY { &ZERO_KEY_ALIAS } else { key };
+        let hash = self.hasher.hash_one(key);
+        // High bits pick the shard; the multiply-shift in `Table::start` is
+        // dominated by them too, so mix before reusing the hash for the slot.
+        let shard_index = (hash >> 58) as usize & (self.shards.len() - 1);
+        let slot_hash = hash.wrapping_mul(0x9e37_79b9_7f4a_7c15).rotate_left(29);
+
+        let mut guard = self.shards[shard_index]
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let gens = &mut *guard;
+        let shard = &mut *guard;
 
-        let age = now.saturating_duration_since(gens.rotated_at);
+        let age = now.saturating_duration_since(shard.rotated_at);
         if age >= self.window {
-            // After two idle windows nothing in either generation is still needed.
-            gens.previous = if age >= self.window * 2 {
-                HashSet::new()
-            } else {
-                std::mem::take(&mut gens.current)
-            };
-            gens.current = HashSet::new();
-            gens.rotated_at = now;
+            shard.rotate(now);
+            if age >= self.window * 2 {
+                // Nothing in the generation just moved to `previous` is still needed.
+                shard.previous.clear();
+            }
         }
 
-        if gens.current.contains(key) || gens.previous.contains(key) {
+        if shard.current.contains(key, slot_hash) || shard.previous.contains(key, slot_hash) {
             return false;
         }
 
-        if gens.current.len() >= self.capacity {
-            gens.previous = std::mem::take(&mut gens.current);
-            gens.rotated_at = now;
-            let total = self.early_rotations.fetch_add(1, Ordering::Relaxed) + 1;
+        let early = shard.current.len >= self.shard_capacity;
+        if early {
+            shard.rotate(now);
+        }
+        shard.current.insert(key, slot_hash);
+        drop(guard);
+        if early {
+            self.note_early_rotation(now);
+        }
+        true
+    }
+
+    fn note_early_rotation(&self, now: Instant) {
+        let total = self.early_rotations.fetch_add(1, Ordering::Relaxed) + 1;
+        let secs = now.saturating_duration_since(self.created).as_secs();
+        let last = self.last_warning_secs.load(Ordering::Relaxed);
+        let due = last == u64::MAX || secs >= last.saturating_add(EARLY_ROTATION_LOG_INTERVAL_SECS);
+        if due
+            && self
+                .last_warning_secs
+                .compare_exchange(last, secs, Ordering::Relaxed, Ordering::Relaxed)
+                .is_ok()
+        {
             tracing::warn!(
                 total,
-                capacity = self.capacity,
-                "replay cache filled before the skew window elapsed; raise replay_cache_entries"
+                "replay cache shard filled before the skew window elapsed; raise replay_cache_entries"
             );
         }
-        gens.current.insert(*key);
-        true
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::AtomicBool;
+    use std::sync::Arc;
 
     const WINDOW: Duration = Duration::from_secs(1800);
 
     fn key(n: u32) -> [u8; KEY_LEN] {
         let mut k = [0u8; KEY_LEN];
         k[..4].copy_from_slice(&n.to_le_bytes());
+        k[8] = 1;
         k
     }
 
@@ -112,6 +250,14 @@ mod tests {
         assert!(!cache.check_and_insert(&key(1)));
         assert!(!cache.check_and_insert(&key(2)));
         assert_eq!(cache.early_rotations(), 0);
+    }
+
+    #[test]
+    fn all_zero_key_is_a_normal_key() {
+        let cache = ReplayCache::new(WINDOW, 16);
+        assert!(cache.check_and_insert(&[0; KEY_LEN]));
+        assert!(!cache.check_and_insert(&[0; KEY_LEN]));
+        assert!(cache.check_and_insert(&key(1)));
     }
 
     #[test]
@@ -155,14 +301,15 @@ mod tests {
     }
 
     #[test]
-    fn stays_bounded_and_counts_early_rotations() {
+    fn single_shard_stays_bounded_and_counts_early_rotations() {
         let capacity = 100;
         let cache = ReplayCache::new(WINDOW, capacity);
+        assert_eq!(cache.shard_count(), 1);
         for n in 0..1000 {
             assert!(cache.check_and_insert(&key(n)));
-            let gens = cache.generations.lock().unwrap();
-            assert!(gens.current.len() <= capacity);
-            assert!(gens.previous.len() <= capacity);
+            let shard = cache.shards[0].lock().unwrap();
+            assert!(shard.current.len <= capacity);
+            assert!(shard.previous.len <= capacity);
         }
         assert_eq!(cache.early_rotations(), 9);
         // The most recent `capacity` keys are always still known.
@@ -179,8 +326,59 @@ mod tests {
     }
 
     #[test]
+    fn shard_count_scales_with_capacity() {
+        for (capacity, shards) in [
+            (1, 1),
+            (4095, 1),
+            (8192, 2),
+            (20_000, 4),
+            (262_144, 64),
+            (2_000_000, 64),
+            (50_000_000, 64),
+        ] {
+            assert_eq!(
+                ReplayCache::new(WINDOW, capacity).shard_count(),
+                shards,
+                "capacity {capacity}"
+            );
+        }
+    }
+
+    #[test]
+    fn memory_is_fixed_and_matches_the_documented_cost() {
+        let capacity = 2_000_000;
+        let cache = ReplayCache::new(WINDOW, capacity);
+        let bytes = cache.memory_bytes();
+        // 32-byte slots * 4/3 * two generations = 85.33 bytes per entry.
+        let per_entry = bytes as f64 / capacity as f64;
+        assert!((85.3..85.4).contains(&per_entry), "{per_entry}");
+        assert!(bytes < 171 * 1024 * 1024);
+
+        for n in 0..50_000 {
+            cache.check_and_insert(&key(n));
+        }
+        assert_eq!(cache.memory_bytes(), bytes);
+    }
+
+    #[test]
+    fn full_capacity_fits_without_early_rotation_when_keys_spread_evenly() {
+        // 64 shards; random keys spread with some imbalance, so fill to 90%.
+        let capacity = 400_000;
+        let cache = ReplayCache::new(WINDOW, capacity);
+        assert_eq!(cache.shard_count(), 64);
+        let fill = capacity as u32 * 9 / 10;
+        for n in 0..fill {
+            assert!(cache.check_and_insert(&key(n)));
+        }
+        assert_eq!(cache.early_rotations(), 0);
+        for n in (0..fill).step_by(97) {
+            assert!(!cache.check_and_insert(&key(n)));
+        }
+    }
+
+    #[test]
     fn concurrent_inserts_admit_each_key_once() {
-        let cache = std::sync::Arc::new(ReplayCache::new(WINDOW, 100_000));
+        let cache = Arc::new(ReplayCache::new(WINDOW, 100_000));
         let handles: Vec<_> = (0..8)
             .map(|_| {
                 let cache = cache.clone();
@@ -193,5 +391,111 @@ mod tests {
             .collect();
         let admitted: usize = handles.into_iter().map(|h| h.join().unwrap()).sum();
         assert_eq!(admitted, 2000);
+    }
+
+    /// Time-driven rollover while eight threads insert: every key is admitted
+    /// exactly once, replays inside the window are always caught across the
+    /// rollover, and the tables never exceed their fixed size.
+    #[test]
+    fn generation_rollover_under_load() {
+        const THREADS: u32 = 8;
+        const STEPS: u32 = 240;
+        const PER_STEP: u32 = 250;
+        let step = WINDOW / 40;
+        let cache = Arc::new(ReplayCache::new(WINDOW, 200_000));
+        assert!(cache.shard_count() > 1);
+        let memory = cache.memory_bytes();
+        let start = Instant::now();
+        let failed = Arc::new(AtomicBool::new(false));
+        // All threads share one simulated clock: nobody starts step s + 1
+        // before everyone has finished step s.
+        let clock = Arc::new(std::sync::Barrier::new(THREADS as usize));
+
+        let handles: Vec<_> = (0..THREADS)
+            .map(|thread| {
+                let cache = cache.clone();
+                let failed = failed.clone();
+                let clock = clock.clone();
+                std::thread::spawn(move || {
+                    for s in 0..STEPS {
+                        // Six windows of simulated time in total.
+                        let now = start + step * s;
+                        for i in 0..PER_STEP {
+                            let n = (thread << 24) | (s * PER_STEP + i);
+                            let fresh = cache.check_and_insert_at(&key(n), now);
+                            let replay_now = cache.check_and_insert_at(&key(n), now);
+                            // Replay of a key from just under one window ago.
+                            let replay_old = s < 39
+                                || !cache.check_and_insert_at(
+                                    &key((thread << 24) | ((s - 39) * PER_STEP + i)),
+                                    now,
+                                );
+                            if !fresh || replay_now || !replay_old {
+                                failed.store(true, Ordering::Relaxed);
+                            }
+                        }
+                        clock.wait();
+                    }
+                })
+            })
+            .collect();
+        for handle in handles {
+            handle.join().unwrap();
+        }
+
+        assert!(!failed.load(Ordering::Relaxed));
+        // 2000 keys per step * 40 steps = 80k per window, under the 200k capacity.
+        assert_eq!(cache.early_rotations(), 0);
+        assert_eq!(cache.memory_bytes(), memory);
+        for shard in cache.shards.iter() {
+            let shard = shard.lock().unwrap();
+            assert!(shard.current.len <= cache.shard_capacity);
+            assert!(shard.previous.len <= cache.shard_capacity);
+        }
+        // Keys from the first window were dropped by the rollovers: after two
+        // more windows they are admitted again.
+        let end = start + step * STEPS;
+        assert!(cache.check_and_insert_at(&key(5), end));
+    }
+
+    /// Capacity-driven rollover: far more keys than fit. The cache stays
+    /// bounded, counts the early rotations, and still never admits a key twice
+    /// in a row.
+    #[test]
+    fn early_rollover_under_load() {
+        const THREADS: u32 = 8;
+        const KEYS: u32 = 60_000;
+        let cache = Arc::new(ReplayCache::new(WINDOW, 16_384));
+        assert_eq!(cache.shard_count(), 4);
+        let memory = cache.memory_bytes();
+
+        let handles: Vec<_> = (0..THREADS)
+            .map(|thread| {
+                let cache = cache.clone();
+                std::thread::spawn(move || {
+                    let mut wrong = 0u32;
+                    for i in 0..KEYS {
+                        let k = key((thread << 24) | i);
+                        if !cache.check_and_insert(&k) {
+                            wrong += 1;
+                        }
+                        if cache.check_and_insert(&k) {
+                            wrong += 1;
+                        }
+                    }
+                    wrong
+                })
+            })
+            .collect();
+        let wrong: u32 = handles.into_iter().map(|h| h.join().unwrap()).sum();
+
+        assert_eq!(wrong, 0);
+        assert!(cache.early_rotations() >= u64::from(THREADS * KEYS / 16_384) - 4);
+        assert_eq!(cache.memory_bytes(), memory);
+        for shard in cache.shards.iter() {
+            let shard = shard.lock().unwrap();
+            assert!(shard.current.len <= cache.shard_capacity);
+            assert!(shard.previous.len <= cache.shard_capacity);
+        }
     }
 }
