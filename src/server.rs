@@ -10,13 +10,13 @@ use tokio::time::Instant;
 use crate::cipher::Ctr;
 use crate::config::{Config, Secret, UpstreamMode};
 use crate::dc::DcTable;
+use crate::mask::Masker;
 use crate::obfs2::{self, ClientInit, InitError, INIT_LEN, TAG_SECURE};
 use crate::relay::{relay, Ciphers};
 use crate::replay::ReplayCache;
-use crate::stats::Stats;
+use crate::stats::{HandshakeResult, MaskResult, Stats};
 use crate::tls::{
-    self, HelloError, RecordError, RecordReader, SkewPolicy, MAX_RECORD_PAYLOAD,
-    MIN_CLIENT_HELLO_PAYLOAD, RECORD_HEADER_LEN,
+    self, HelloError, RecordError, RecordReader, SkewPolicy, MAX_RECORD_PAYLOAD, RECORD_HEADER_LEN,
 };
 
 // Fake certificate size range used by mtprotoproxy before it learns the real one.
@@ -31,11 +31,12 @@ pub struct Proxy {
     dc: DcTable,
     upstream_mode: UpstreamMode,
     handshake_timeout: Duration,
-    stats: Stats,
+    masker: Masker,
+    stats: Arc<Stats>,
 }
 
 impl Proxy {
-    pub fn stats(&self) -> &Stats {
+    pub fn stats(&self) -> &Arc<Stats> {
         &self.stats
     }
 
@@ -49,8 +50,20 @@ impl Proxy {
         for (index, addr) in config.parsed_dc_overrides()? {
             dc = dc.with_override(index, addr);
         }
+        let secrets = config.parsed_secrets()?;
+        let masker = Masker::new(
+            config.parsed_mask_domains()?,
+            config.default_mask(&secrets)?,
+            config.mask_max_connections,
+        );
+        let stats = Stats::new(
+            masker
+                .target_names()
+                .map(str::to_owned)
+                .chain(secrets.iter().map(|s| s.domain.clone())),
+        );
         Ok(Self {
-            secrets: config.parsed_secrets()?,
+            secrets,
             replay: ReplayCache::new(
                 Duration::from_secs(skew.window_secs()),
                 config.replay_cache_entries,
@@ -59,7 +72,8 @@ impl Proxy {
             dc,
             upstream_mode: config.upstream_mode,
             handshake_timeout: Duration::from_secs(config.handshake_timeout_secs),
-            stats: Stats::default(),
+            masker,
+            stats: Arc::new(stats),
         })
     }
 }
@@ -78,6 +92,38 @@ enum Reject {
     Replay,
 }
 
+impl Reject {
+    fn result(&self) -> HandshakeResult {
+        match self {
+            Self::Hello(HelloError::BadDigest) => HandshakeResult::BadDigest,
+            Self::Hello(HelloError::BadTimestamp { .. }) => HandshakeResult::BadTimestamp,
+            Self::Replay => HandshakeResult::Replay,
+            Self::Init(_) => HandshakeResult::BadInit,
+            Self::Hello(HelloError::Malformed) | Self::Record(_) | Self::Io(_) => {
+                HandshakeResult::Malformed
+            }
+        }
+    }
+}
+
+/// What the handshake learned about the client, kept outside its future so it
+/// survives a rejection or a timeout.
+#[derive(Default)]
+struct Seen {
+    /// Every byte read from the client before the proxy replied.
+    bytes: Vec<u8>,
+    /// Set once the fake ServerHello is on the wire. From then on the client
+    /// has seen a proxy-specific answer and handing it to a mask site would
+    /// only produce a broken TLS stream.
+    replied: bool,
+}
+
+impl Seen {
+    fn sni(&self) -> Option<&str> {
+        tls::client_hello_sni(&self.bytes)
+    }
+}
+
 struct Session {
     init: ClientInit,
     records: RecordReader,
@@ -92,19 +138,26 @@ fn unix_now() -> u64 {
         .unwrap_or(0)
 }
 
-async fn handshake(stream: &mut TcpStream, proxy: &Proxy) -> Result<Session, Reject> {
-    let mut record = vec![0u8; RECORD_HEADER_LEN];
-    stream.read_exact(&mut record).await?;
-    let payload_len = usize::from(u16::from_be_bytes([record[3], record[4]]));
-    if record[..3] != [0x16, 0x03, 0x01]
-        || !(MIN_CLIENT_HELLO_PAYLOAD..=MAX_RECORD_PAYLOAD).contains(&payload_len)
-    {
+async fn handshake(
+    stream: &mut TcpStream,
+    proxy: &Proxy,
+    seen: &mut Seen,
+) -> Result<Session, Reject> {
+    let mut header = [0u8; RECORD_HEADER_LEN];
+    stream.read_exact(&mut header).await?;
+    seen.bytes.extend_from_slice(&header);
+    let payload_len = usize::from(u16::from_be_bytes([header[3], header[4]]));
+    // Any TLS handshake record is read in full, even one that cannot be
+    // fake-tls, so its SNI can pick the mask target.
+    if header[..2] != [0x16, 0x03] || payload_len > MAX_RECORD_PAYLOAD {
         return Err(HelloError::Malformed.into());
     }
-    record.resize(RECORD_HEADER_LEN + payload_len, 0);
-    stream.read_exact(&mut record[RECORD_HEADER_LEN..]).await?;
+    let mut payload = vec![0u8; payload_len];
+    stream.read_exact(&mut payload).await?;
+    seen.bytes.extend_from_slice(&payload);
+    drop(payload);
 
-    let hello = tls::verify_client_hello(&record, &proxy.secrets, unix_now(), &proxy.skew)?;
+    let hello = tls::verify_client_hello(&seen.bytes, &proxy.secrets, unix_now(), &proxy.skew)?;
     if !proxy.replay.check_and_insert(&hello.client_random) {
         return Err(Reject::Replay);
     }
@@ -122,6 +175,7 @@ async fn handshake(stream: &mut TcpStream, proxy: &Proxy) -> Result<Session, Rej
             &mut rng,
         )
     };
+    seen.replied = true;
     stream.write_all(&response).await?;
 
     let mut records = RecordReader::new();
@@ -154,8 +208,8 @@ async fn handshake(stream: &mut TcpStream, proxy: &Proxy) -> Result<Session, Rej
     })
 }
 
-/// Reads and discards until the peer closes. Without masking (phase 2) this is
-/// the least distinguishable reaction to a bad handshake: no reply, no reset.
+/// Reads and discards until the peer closes: no reply, no reset. Used when a
+/// failed handshake cannot be handed to a mask site.
 async fn drain(stream: &mut TcpStream) {
     let mut buf = [0u8; 2048];
     while matches!(stream.read(&mut buf).await, Ok(n) if n > 0) {}
@@ -228,36 +282,58 @@ async fn run_session(client: TcpStream, session: Session, proxy: &Proxy) -> io::
 pub async fn handle_client(mut stream: TcpStream, proxy: Arc<Proxy>) {
     let _ = stream.set_nodelay(true);
     let deadline = Instant::now() + proxy.handshake_timeout;
+    let stats = &proxy.stats;
+    let mut seen = Seen::default();
 
-    let session = match tokio::time::timeout_at(deadline, handshake(&mut stream, &proxy)).await {
-        Ok(Ok(session)) => session,
+    let outcome =
+        tokio::time::timeout_at(deadline, handshake(&mut stream, &proxy, &mut seen)).await;
+    let label = stats.label_index(seen.sni());
+    let reason = match outcome {
+        Ok(Ok(session)) => {
+            stats.record_handshake(label, HandshakeResult::Accepted);
+            let _active = stats.session_started(label);
+            drop(seen);
+            let dc_idx = session.init.dc_idx;
+            if let Err(err) = run_session(stream, session, &proxy).await {
+                tracing::debug!(dc = dc_idx, error = %err, "session ended with error");
+            }
+            return;
+        }
         Ok(Err(Reject::Io(err))) => {
             tracing::debug!(error = %err, "handshake aborted");
             return;
         }
-        Ok(Err(reason)) => {
-            if let Reject::Hello(HelloError::BadTimestamp { skew_secs }) = reason {
-                proxy.stats.record_skew_rejection(skew_secs);
-                tracing::debug!(
-                    direction = tls::skew_direction(skew_secs),
-                    offset_secs = skew_secs.unsigned_abs(),
-                    "handshake rejected: client clock outside the skew window"
-                );
-            } else {
-                tracing::debug!(%reason, "handshake rejected");
-            }
-            let _ = tokio::time::timeout_at(deadline, drain(&mut stream)).await;
-            return;
-        }
+        Ok(Err(reason)) => reason,
         Err(_) => {
+            stats.record_handshake(label, HandshakeResult::Timeout);
             tracing::debug!("handshake timed out");
             return;
         }
     };
 
-    let dc_idx = session.init.dc_idx;
-    if let Err(err) = run_session(stream, session, &proxy).await {
-        tracing::debug!(dc = dc_idx, error = %err, "session ended with error");
+    stats.record_handshake(label, reason.result());
+    if let Reject::Hello(HelloError::BadTimestamp { skew_secs }) = reason {
+        stats.record_skew_rejection(skew_secs);
+        tracing::debug!(
+            direction = tls::skew_direction(skew_secs),
+            offset_secs = skew_secs.unsigned_abs(),
+            "handshake rejected: client clock outside the skew window"
+        );
+    } else {
+        tracing::debug!(%reason, "handshake rejected");
+    }
+
+    if seen.replied {
+        let _ = tokio::time::timeout_at(deadline, drain(&mut stream)).await;
+        return;
+    }
+    let (target, result) = proxy
+        .masker
+        .forward(&mut stream, &seen.bytes, seen.sni())
+        .await;
+    stats.record_mask(stats.label_index(Some(target)), result);
+    if result == MaskResult::Limited {
+        let _ = tokio::time::timeout_at(deadline, drain(&mut stream)).await;
     }
 }
 
