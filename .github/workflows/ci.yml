@@ -22,6 +22,22 @@ jobs:
       - run: cargo clippy --all-targets --locked -- -D warnings
       - run: cargo test --locked
 
+  # Resident memory per idle session against the budget in tests/rss.rs,
+  # at a scale that fits a hosted runner.
+  idle-memory:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: memory per idle session (1k -> 5k sessions)
+        run: |
+          ulimit -n 65536
+          cargo test --release --locked --test rss -- --ignored --nocapture
+        env:
+          RSS_BASELINE_SESSIONS: 1000
+          RSS_SESSIONS: 5000
+
   release-musl:
     runs-on: ubuntu-latest
     steps:
