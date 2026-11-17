@@ -95,6 +95,10 @@ fn print_existing(args: &Args) -> anyhow::Result<()> {
     Ok(())
 }
 
+#[cfg(feature = "mimalloc")]
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 fn bind(addr: SocketAddr) -> std::io::Result<std::net::TcpListener> {
     let socket = Socket::new(Domain::for_address(addr), Type::STREAM, Some(Protocol::TCP))?;
     if addr.is_ipv6() {
