@@ -6,6 +6,10 @@ workers = 0                      # 0 = number of CPUs
 # unmeasured: it can help when packet steering (RPS) is set per CPU, and hurt
 # when workers outnumber CPUs or other load shares the machine.
 pin_workers = false
+# Open one SO_REUSEPORT listening socket per worker for each address, so new
+# connections are spread over several accept queues. Experimental: keep it only
+# if `cargo test --release --test storm` shows a higher accept rate on your box.
+reuse_port = false
 
 # Fake-TLS secrets: "ee" + 32 hex chars (16-byte key) + hex of the domain.
 # Generate one with: echo-mtproxy --gen-secret www.example.com

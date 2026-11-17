@@ -21,7 +21,7 @@ mimalloc = { version = "0.1", default-features = false, optional = true }
 rand = "0.8"
 serde = { version = "1", features = ["derive"] }
 sha2 = "0.10"
-socket2 = "0.5"
+socket2 = { version = "0.5", features = ["all"] }
 thiserror = "1"
 tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "time", "macros", "signal", "sync"] }
 toml = "0.8"
