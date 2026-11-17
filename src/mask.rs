@@ -13,9 +13,6 @@ use crate::config::{MaskDomain, MaskTarget};
 use crate::stats::MaskResult;
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
-/// A masked connection with no traffic in one direction for this long is dropped.
-const IDLE_TIMEOUT: Duration = Duration::from_secs(120);
-const DNS_TTL: Duration = Duration::from_secs(300);
 const BUF_LEN: usize = 8192;
 
 /// Forwards connections that failed the handshake to a real TLS site, so the
@@ -26,11 +23,20 @@ pub struct Masker {
     /// Allowlisted targets followed by the default one.
     targets: Vec<MaskDomain>,
     permits: Semaphore,
+    /// A masked connection is dropped when either direction is silent this long.
+    idle_timeout: Duration,
+    dns_ttl: Duration,
     resolved: Mutex<HashMap<usize, (Vec<SocketAddr>, Instant)>>,
 }
 
 impl Masker {
-    pub fn new(allowlist: Vec<MaskDomain>, default: MaskDomain, max_connections: usize) -> Self {
+    pub fn new(
+        allowlist: Vec<MaskDomain>,
+        default: MaskDomain,
+        max_connections: usize,
+        idle_timeout: Duration,
+        dns_ttl: Duration,
+    ) -> Self {
         let allowed = allowlist
             .iter()
             .enumerate()
@@ -42,6 +48,8 @@ impl Masker {
             allowed,
             targets,
             permits: Semaphore::new(max_connections),
+            idle_timeout,
+            dns_ttl,
             resolved: Mutex::new(HashMap::new()),
         }
     }
@@ -75,7 +83,7 @@ impl Masker {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .get(&index)
-            .filter(|(_, at)| at.elapsed() < DNS_TTL)
+            .filter(|(_, at)| at.elapsed() < self.dns_ttl)
             .map(|(addrs, _)| addrs.clone());
         if let Some(addrs) = cached {
             return Ok(addrs);
@@ -134,8 +142,8 @@ impl Masker {
             let (client_read, client_write) = client.split();
             let (server_read, server_write) = server.split();
             tokio::try_join!(
-                pipe(client_read, server_write),
-                pipe(server_read, client_write)
+                pipe(client_read, server_write, self.idle_timeout),
+                pipe(server_read, client_write, self.idle_timeout)
             )
         };
         if matches!(&result, Err(err) if err.kind() == io::ErrorKind::ConnectionReset) {
@@ -146,14 +154,14 @@ impl Masker {
     }
 }
 
-async fn pipe<R, W>(mut from: R, mut to: W) -> io::Result<()>
+async fn pipe<R, W>(mut from: R, mut to: W, idle: Duration) -> io::Result<()>
 where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin,
 {
     let mut buf = vec![0u8; BUF_LEN];
     loop {
-        let n = tokio::time::timeout(IDLE_TIMEOUT, from.read(&mut buf))
+        let n = tokio::time::timeout(idle, from.read(&mut buf))
             .await
             .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "mask connection idle"))??;
         if n == 0 {
@@ -179,13 +187,19 @@ mod tests {
     }
 
     fn masker() -> Masker {
+        masker_with_ttl(Duration::from_secs(300))
+    }
+
+    fn masker_with_ttl(dns_ttl: Duration) -> Masker {
         Masker::new(
             vec![
                 domain("google.com", "google.com", 443),
                 domain("local.example", "127.0.0.1", 8443),
             ],
-            domain("default.example", "default.example", 443),
+            domain("localhost.test", "localhost", 443),
             4,
+            Duration::from_secs(120),
+            dns_ttl,
         )
     }
 
@@ -211,19 +225,19 @@ mod tests {
             Some("notgoogle.com"),
             Some("10.0.0.1"),
             Some("localhost"),
-            Some("default.example"),
+            Some("localhost.test"),
             Some("google.com\0"),
         ] {
-            assert_eq!(masker.select(sni).domain, "default.example", "{sni:?}");
+            assert_eq!(masker.select(sni).domain, "localhost.test", "{sni:?}");
         }
         let long = "a".repeat(1_000_000);
-        assert_eq!(masker.select(Some(&long)).domain, "default.example");
+        assert_eq!(masker.select(Some(&long)).domain, "localhost.test");
     }
 
     #[test]
     fn target_names_list_the_default_last() {
         let names: Vec<_> = masker().target_names().map(str::to_owned).collect();
-        assert_eq!(names, ["google.com", "local.example", "default.example"]);
+        assert_eq!(names, ["google.com", "local.example", "localhost.test"]);
     }
 
     #[tokio::test]
@@ -233,5 +247,83 @@ mod tests {
         let addrs = masker.resolve(&target.target, 1).await.unwrap();
         assert_eq!(addrs, ["127.0.0.1:8443".parse().unwrap()]);
         assert!(masker.resolved.lock().unwrap().is_empty());
+    }
+
+    const DEFAULT: usize = 2;
+
+    async fn resolve_default(masker: &Masker) -> Vec<SocketAddr> {
+        let target = masker.select(None).target.clone();
+        masker.resolve(&target, DEFAULT).await.unwrap()
+    }
+
+    /// Replaces the cached answer so a cache hit is distinguishable from a lookup.
+    fn poison_cache(masker: &Masker) -> SocketAddr {
+        let marker: SocketAddr = "192.0.2.77:443".parse().unwrap();
+        let mut cache = masker.resolved.lock().unwrap();
+        let entry = cache.get_mut(&DEFAULT).expect("lookup was not cached");
+        entry.0 = vec![marker];
+        marker
+    }
+
+    #[tokio::test]
+    async fn resolved_hosts_are_reused_within_the_ttl() {
+        let masker = masker_with_ttl(Duration::from_secs(300));
+        let real = resolve_default(&masker).await;
+        assert!(real.iter().all(|a| a.ip().is_loopback() && a.port() == 443));
+        let marker = poison_cache(&masker);
+        assert_eq!(resolve_default(&masker).await, [marker]);
+    }
+
+    #[tokio::test]
+    async fn zero_ttl_resolves_every_time() {
+        let masker = masker_with_ttl(Duration::ZERO);
+        let real = resolve_default(&masker).await;
+        let marker = poison_cache(&masker);
+        let again = resolve_default(&masker).await;
+        assert_eq!(again, real);
+        assert!(!again.contains(&marker));
+    }
+
+    #[tokio::test]
+    async fn expired_entries_are_resolved_again() {
+        let masker = masker_with_ttl(Duration::from_millis(50));
+        let real = resolve_default(&masker).await;
+        let marker = poison_cache(&masker);
+        assert_eq!(resolve_default(&masker).await, [marker]);
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        assert_eq!(resolve_default(&masker).await, real);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn pipe_times_out_only_when_idle() {
+        const IDLE: Duration = Duration::from_secs(120);
+        let (mut near, far) = tokio::io::duplex(64);
+        let (mut sink_reader, sink) = tokio::io::duplex(64);
+        let task = tokio::spawn(pipe(far, sink, IDLE));
+
+        let mut byte = [0u8; 1];
+        for _ in 0..5 {
+            tokio::time::sleep(Duration::from_secs(100)).await;
+            near.write_all(b"x").await.unwrap();
+            sink_reader.read_exact(&mut byte).await.unwrap();
+            assert!(!task.is_finished());
+        }
+        let start = tokio::time::Instant::now();
+        let err = task.await.unwrap().unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::TimedOut);
+        assert_eq!(start.elapsed(), IDLE);
+    }
+
+    #[tokio::test]
+    async fn pipe_forwards_eof_as_shutdown() {
+        let (mut near, far) = tokio::io::duplex(64);
+        let (mut sink_reader, sink) = tokio::io::duplex(64);
+        let task = tokio::spawn(pipe(far, sink, Duration::from_secs(5)));
+        near.write_all(b"bye").await.unwrap();
+        near.shutdown().await.unwrap();
+        let mut out = Vec::new();
+        sink_reader.read_to_end(&mut out).await.unwrap();
+        assert_eq!(out, b"bye");
+        task.await.unwrap().unwrap();
     }
 }

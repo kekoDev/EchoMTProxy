@@ -222,6 +222,9 @@ pub struct Config {
     /// SNI allowlist: `domain` or `domain=host:port`.
     pub mask_domains: Vec<String>,
     pub mask_max_connections: usize,
+    pub mask_idle_timeout_secs: u64,
+    /// 0 resolves the mask host on every masked connection.
+    pub mask_dns_ttl_secs: u64,
     pub upstream_mode: UpstreamMode,
     pub prefer_ipv6_upstream: bool,
     pub time_skew_behind_secs: u64,
@@ -250,6 +253,8 @@ impl Default for Config {
             mask_host: String::new(),
             mask_domains: Vec::new(),
             mask_max_connections: 4096,
+            mask_idle_timeout_secs: 120,
+            mask_dns_ttl_secs: 300,
             upstream_mode: UpstreamMode::Fast,
             prefer_ipv6_upstream: true,
             time_skew_behind_secs: 600,
@@ -271,6 +276,10 @@ impl Config {
         let config: Config = toml::from_str(text)?;
         anyhow::ensure!(!config.listen.is_empty(), "`listen` must not be empty");
         anyhow::ensure!(!config.secrets.is_empty(), "`secrets` must not be empty");
+        anyhow::ensure!(
+            config.mask_idle_timeout_secs > 0,
+            "`mask_idle_timeout_secs` must be greater than 0"
+        );
         anyhow::ensure!(
             config.max_connections > 0,
             "`max_connections` must be greater than 0"
@@ -509,6 +518,8 @@ mod tests {
         assert_eq!(config.idle_timeout_secs, 900);
         assert!(config.prefer_ipv6_upstream);
         assert!(config.dc_override.is_empty());
+        assert_eq!(config.mask_idle_timeout_secs, 120);
+        assert_eq!(config.mask_dns_ttl_secs, 300);
     }
 
     #[test]
@@ -521,6 +532,8 @@ mod tests {
         assert!(Config::parse(&format!("{base}cipher_backend = \"openssl\"")).is_err());
         assert!(Config::parse(&format!("{base}replay_cache_entries = 0")).is_err());
         assert!(Config::parse(&format!("{base}max_connections = 0")).is_err());
+        assert!(Config::parse(&format!("{base}mask_idle_timeout_secs = 0")).is_err());
+        assert!(Config::parse(&format!("{base}mask_dns_ttl_secs = 0")).is_ok());
         assert!(Config::parse("").is_err());
     }
 

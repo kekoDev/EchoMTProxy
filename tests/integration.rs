@@ -1140,3 +1140,24 @@ async fn held_over_limit_connections_are_bounded() {
     assert_eq!(handle.stats().connections_over_limit(), 80);
     assert_eq!(handle.stats().connections_open(), 1);
 }
+
+#[tokio::test]
+async fn masked_connection_is_dropped_after_mask_idle_timeout() {
+    let setup = spawn_masked_proxy("mask_idle_timeout_secs = 1").await;
+    let hello = signed_hello_for("a.example", &[0x42; 16], unix_now());
+    let (mut stream, site) = masked_by(setup.proxy, &hello).await;
+    assert_eq!(site, "A");
+
+    let idle_since = std::time::Instant::now();
+    let mut buf = [0u8; 8];
+    let read = timeout(Duration::from_secs(5), stream.read(&mut buf)).await;
+    assert!(matches!(
+        read.expect("idle masked connection stayed open"),
+        Ok(0) | Err(_)
+    ));
+    let idle = idle_since.elapsed();
+    assert!(
+        idle >= Duration::from_millis(900) && idle < Duration::from_secs(3),
+        "{idle:?}"
+    );
+}

@@ -66,6 +66,8 @@ impl Proxy {
             config.parsed_mask_domains()?,
             config.default_mask(&secrets)?,
             config.mask_max_connections,
+            Duration::from_secs(config.mask_idle_timeout_secs),
+            Duration::from_secs(config.mask_dns_ttl_secs),
         );
         let stats = Stats::new(
             masker
