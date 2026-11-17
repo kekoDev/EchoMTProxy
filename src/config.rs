@@ -238,6 +238,8 @@ pub struct Config {
     pub mask_dns_ttl_secs: u64,
     pub upstream_mode: UpstreamMode,
     pub prefer_ipv6_upstream: bool,
+    /// Local addresses to connect to DCs from, rotated per connection.
+    pub upstream_bind_addrs: Vec<std::net::IpAddr>,
     pub time_skew_behind_secs: u64,
     pub time_skew_ahead_secs: u64,
     pub accept_uptime_timestamps: bool,
@@ -272,6 +274,7 @@ impl Default for Config {
             mask_dns_ttl_secs: 300,
             upstream_mode: UpstreamMode::Fast,
             prefer_ipv6_upstream: true,
+            upstream_bind_addrs: Vec::new(),
             time_skew_behind_secs: 600,
             time_skew_ahead_secs: 1200,
             accept_uptime_timestamps: true,
@@ -541,6 +544,7 @@ mod tests {
         assert_eq!(config.idle_timeout_secs, 900);
         assert!(config.prefer_ipv6_upstream);
         assert!(config.dc_override.is_empty());
+        assert!(config.upstream_bind_addrs.is_empty());
         assert_eq!(config.mask_idle_timeout_secs, 120);
         assert_eq!(config.media_burst_bytes, 10_000_000);
         assert_eq!(config.media_rate_bps, 3_000_000);
@@ -709,6 +713,24 @@ mod tests {
         let config = Config::parse(&base).unwrap();
         assert_eq!(config.metrics_addr(), "127.0.0.1:9100".parse().ok());
         assert!(Config::parse(&format!("{base}metrics_listen = \"nope\"")).is_err());
+    }
+
+    #[test]
+    fn upstream_bind_addrs_are_ip_addresses() {
+        let base = format!("secrets = [\"{}\"]\n", ee("a.com"));
+        let config = Config::parse(&format!(
+            "{base}upstream_bind_addrs = [\"2001:db8::10\", \"203.0.113.5\"]"
+        ))
+        .unwrap();
+        assert_eq!(config.upstream_bind_addrs.len(), 2);
+        assert!(config.upstream_bind_addrs[0].is_ipv6());
+        assert!(config.upstream_bind_addrs[1].is_ipv4());
+        for bad in ["[\"example.com\"]", "[\"1.2.3.4:443\"]", "[\"\"]"] {
+            assert!(
+                Config::parse(&format!("{base}upstream_bind_addrs = {bad}")).is_err(),
+                "{bad}"
+            );
+        }
     }
 
     #[test]

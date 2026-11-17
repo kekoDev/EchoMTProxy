@@ -1133,3 +1133,26 @@ async fn congestion_scales_media_down_and_recovers() {
     assert!(limits.egress_bps() < 4_000_000);
     assert!(limits.bytes(Lane::Chat) > limits.bytes(Lane::Media));
 }
+
+#[tokio::test]
+async fn sessions_work_with_upstream_bind_addrs() {
+    let dc = spawn_echo_dc(true).await;
+    let proxy =
+        spawn_proxy_with("fast", dc, "upstream_bind_addrs = [\"127.0.0.1\", \"::1\"]").await;
+    for _ in 0..5 {
+        let mut client = Client::connect(proxy, DC).await;
+        assert_eq!(client.echo(b"bound upstream").await, b"bound upstream");
+    }
+}
+
+#[tokio::test]
+async fn unassigned_upstream_bind_addr_fails_at_startup() {
+    let config = echo_mtproxy::config::Config::parse(&format!(
+        "secrets = [\"{SECRET_HEX}\"]\nupstream_bind_addrs = [\"192.0.2.77\"]\n"
+    ))
+    .unwrap();
+    let err = Proxy::from_config(&config)
+        .err()
+        .expect("startup should fail");
+    assert!(format!("{err:#}").contains("192.0.2.77"), "{err:#}");
+}

@@ -62,6 +62,7 @@ impl Proxy {
         for (index, addr) in config.parsed_dc_overrides()? {
             dc = dc.with_override(index, addr);
         }
+        let dc = dc.with_bind_addrs(&config.upstream_bind_addrs)?;
         let secrets = config.parsed_secrets()?;
         let masker = Masker::new(
             config.parsed_mask_domains()?,

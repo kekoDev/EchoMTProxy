@@ -27,6 +27,13 @@ mask_max_connections = 4096      # concurrent masked connections; beyond this, n
 mask_idle_timeout_secs = 120     # drop a masked connection when either direction is silent this long
 mask_dns_ttl_secs = 300          # how long a resolved mask host is reused; 0 = resolve every time
 prefer_ipv6_upstream = true
+# Local source addresses for connections to Telegram, used in rotation per
+# address family. One source address can only hold a limited number of
+# connections to one DC address (the ephemeral port range), so list every
+# address this server has, e.g. its IPv4 address and all its IPv6 addresses.
+# Empty = let the kernel choose. Each address must be assigned to this host.
+upstream_bind_addrs = []
+# upstream_bind_addrs = ["203.0.113.5", "2001:db8::10", "2001:db8::11", "2001:db8::12", "2001:db8::13"]
 
 # Media limiting. A connection whose client marks it as media (negative DC
 # index) may relay media_burst_bytes at full speed, then media_rate_bps, both
