@@ -5,8 +5,8 @@ High-performance MTProto proxy in Rust — Fake-TLS, built for hundreds of thous
 Status: early. The proxy accepts Fake-TLS (`ee`) secrets, relays to Telegram DCs
 in direct mode, forwards failed handshakes to a mask site, enforces connection
 and idle limits and exports metrics. Idle sessions hold no relay buffer: on
-Linux an idle session costs about 4.4 KiB of resident memory in the proxy
-(measured by `tests/rss.rs`). Per-core listeners are not implemented yet.
+the target server an idle session costs about 4.1 KiB of resident memory in
+the proxy (measured by `tests/rss.rs`). Per-core listeners are not implemented yet.
 
 ## Build
 
@@ -179,7 +179,8 @@ The memory test starts the real binary, opens 1 000 and then 50 000 idle
 sessions (`RSS_BASELINE_SESSIONS`, `RSS_SESSIONS`), and compares the proxy's
 VmRSS between the two, reporting kernel socket memory separately. It needs
 about 101 000 descriptors per process, so run it with `ulimit -n 200000`. It
-fails above 8 KiB per idle session; CI runs it at 1 000 to 5 000 sessions.
+fails above 5 KiB per idle session at that scale. CI runs it at 1 000 to 5 000
+sessions with an 8 KiB limit, because readings over so few sessions vary.
 
 To see which allocation sites idle sessions keep alive (dhat, needs symbols):
 

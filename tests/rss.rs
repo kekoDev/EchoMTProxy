@@ -43,12 +43,21 @@ const PROXY_ADDRS: [[u8; 4]; 4] = [
 ];
 const DC_COUNT: usize = 5;
 
-/// Ceiling for resident bytes per idle session.
+/// Ceiling for resident bytes per idle session at full scale.
 ///
-/// Measured at 4.4 KiB with glibc (release build, 1 000 -> 50 000 sessions,
-/// fast mode): two 1 KiB cipher states, a 1.4 KiB task, two socket
-/// registrations and allocator overhead. Idle sessions hold no relay buffer.
-const BUDGET_BYTES_PER_IDLE_SESSION: u64 = 8 * 1024;
+/// Measured over 1 000 -> 50 000 sessions in fast mode: 4.1 KiB on the target
+/// server with mimalloc, 4.6 KiB there with glibc malloc. That is two 1 KiB
+/// cipher states, a 1.4 KiB task, two socket registrations and allocator
+/// overhead; idle sessions hold no relay buffer.
+const BUDGET_BYTES_PER_IDLE_SESSION: u64 = 5 * 1024;
+
+/// Ceiling when fewer than `FULL_SCALE_SESSIONS` are measured.
+///
+/// mimalloc commits memory in large steps, so over a few thousand sessions the
+/// same build reads anywhere from 5.1 to 6.1 KiB per session. A small run can
+/// only catch gross regressions.
+const SMALL_SCALE_BUDGET_BYTES: u64 = 8 * 1024;
+const FULL_SCALE_SESSIONS: u64 = 20_000;
 
 struct ProxyProcess(Child);
 
@@ -294,13 +303,18 @@ async fn idle_session_memory_stays_within_budget() {
     }
 
     let per_session = high.proxy_rss.saturating_sub(low.proxy_rss) / measured;
+    let budget = if measured >= FULL_SCALE_SESSIONS {
+        BUDGET_BYTES_PER_IDLE_SESSION
+    } else {
+        SMALL_SCALE_BUDGET_BYTES
+    };
     let harness_per_session = high.harness_rss.saturating_sub(low.harness_rss) / measured;
     let tcp_pages = high.tcp_mem_pages.saturating_sub(low.tcp_mem_pages);
     let tcp_bytes = tcp_pages * page_size();
 
     println!("idle-session memory ({baseline} -> {total} sessions, median of {SAMPLES} samples)");
     println!(
-        "  proxy VmRSS:        {:9.1} MiB -> {:9.1} MiB   {per_session} bytes/session (budget {BUDGET_BYTES_PER_IDLE_SESSION})",
+        "  proxy VmRSS:        {:9.1} MiB -> {:9.1} MiB   {per_session} bytes/session (budget {budget})",
         mib(low.proxy_rss),
         mib(high.proxy_rss)
     );
@@ -319,9 +333,8 @@ async fn idle_session_memory_stays_within_budget() {
 
     // A difference that rounds to zero is under budget, not a failure.
     assert!(
-        per_session <= BUDGET_BYTES_PER_IDLE_SESSION,
-        "{per_session} resident bytes per idle session exceeds the budget of \
-         {BUDGET_BYTES_PER_IDLE_SESSION}"
+        per_session <= budget,
+        "{per_session} resident bytes per idle session exceeds the budget of {budget}"
     );
     drop(sessions);
 }
