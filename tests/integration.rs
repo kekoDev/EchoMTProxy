@@ -1383,3 +1383,96 @@ async fn reset_after_the_dc_has_answered_is_not_retried() {
     assert_eq!(hits.load(Ordering::Relaxed), 1);
     assert_eq!(handle.stats().upstream_retries(), (0, 0));
 }
+
+#[tokio::test]
+async fn binary_serves_every_listen_address() {
+    let dc = spawn_echo_dc(true).await;
+    let mask = spawn_blackhole().await;
+    let (first, second) = (free_port(), free_port());
+    let listen: Vec<SocketAddr> = vec![
+        format!("127.0.0.1:{first}").parse().unwrap(),
+        format!("127.0.0.1:{second}").parse().unwrap(),
+        format!("[::1]:{first}").parse().unwrap(),
+    ];
+    let listed = listen
+        .iter()
+        .map(|a| format!("\"{a}\""))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let metrics: SocketAddr = format!("127.0.0.1:{}", free_port()).parse().unwrap();
+    let _proxy = start_proxy_process(
+        "ports",
+        &format!(
+            "listen = [{listed}]\n\
+             secrets = [\"{SECRET_HEX}\"]\n\
+             mask_host = \"{mask}\"\n\
+             metrics_listen = \"{metrics}\"\n\
+             [dc_override]\n\
+             {DC} = \"{dc}\"\n"
+        ),
+        listen[0],
+    )
+    .await;
+
+    // A full session on each address, all held open at the same time.
+    let mut sessions = Vec::new();
+    for addr in &listen {
+        let mut client = Client::connect(*addr, DC).await;
+        let data = format!("via {addr}");
+        assert_eq!(client.echo(data.as_bytes()).await, data.as_bytes());
+        sessions.push(client);
+    }
+    for client in &mut sessions {
+        assert_eq!(client.echo(b"still open").await, b"still open");
+    }
+
+    // One process, one set of counters: all three sessions show up together.
+    let mut http = TcpStream::connect(metrics).await.unwrap();
+    http.write_all(b"GET /metrics HTTP/1.1\r\nHost: x\r\n\r\n")
+        .await
+        .unwrap();
+    let mut text = String::new();
+    http.read_to_string(&mut text).await.unwrap();
+    assert!(
+        text.lines()
+            .any(|l| l
+                == "echo_mtproxy_handshakes_total{sni=\"www.example.com\",result=\"accepted\"} 3"),
+        "{text}"
+    );
+    assert!(text
+        .lines()
+        .any(|l| l == "echo_mtproxy_sessions_active{sni=\"www.example.com\"} 3"));
+}
+
+#[tokio::test]
+async fn binary_refuses_to_start_when_a_listen_address_is_taken() {
+    let taken = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let busy = taken.local_addr().unwrap();
+    let free = free_port();
+    let config: std::path::PathBuf = [
+        env!("CARGO_TARGET_TMPDIR"),
+        &format!("busy-{}.toml", std::process::id()),
+    ]
+    .iter()
+    .collect();
+    std::fs::write(
+        &config,
+        format!(
+            "listen = [\"127.0.0.1:{free}\", \"{busy}\"]\n\
+             secrets = [\"{SECRET_HEX}\"]\nmetrics_listen = \"\"\n"
+        ),
+    )
+    .unwrap();
+    let output = tokio::process::Command::new(env!("CARGO_BIN_EXE_echo-mtproxy"))
+        .arg("--config")
+        .arg(&config)
+        .output();
+    let output = timeout(STEP, output)
+        .await
+        .expect("the proxy kept running with a listen address it could not bind")
+        .unwrap();
+    let _ = std::fs::remove_file(&config);
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains(&busy.to_string()), "{stderr}");
+}
