@@ -371,6 +371,7 @@ dependencies = [
  "ctr",
  "hex",
  "hmac",
+ "libc",
  "proptest",
  "rand 0.8.8",
  "serde",

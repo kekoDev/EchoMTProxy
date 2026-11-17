@@ -212,8 +212,13 @@ impl Client {
     }
 
     pub async fn connect_with_sni(proxy: SocketAddr, dc_idx: i16, sni: &str) -> Self {
+        let stream = TcpStream::connect(proxy).await.unwrap();
+        Self::handshake(stream, dc_idx, sni).await
+    }
+
+    /// Runs the client side of both handshakes on an already connected socket.
+    pub async fn handshake(mut stream: TcpStream, dc_idx: i16, sni: &str) -> Self {
         let secret = secret();
-        let mut stream = TcpStream::connect(proxy).await.unwrap();
         let hello = signed_hello_for(sni, &secret.key, unix_now());
         stream.write_all(&hello).await.unwrap();
 
@@ -283,4 +288,82 @@ pub fn random_bytes(len: usize) -> Vec<u8> {
 pub async fn stays_silent(stream: &mut TcpStream) -> bool {
     let mut buf = [0u8; 1];
     timeout(SILENCE, stream.read(&mut buf)).await.is_err()
+}
+
+/// Raises this process's open-file soft limit towards `needed` and returns the
+/// limit now in effect. Child processes inherit it.
+#[cfg(unix)]
+// rlim_t is u64 on the platforms tested so far, but not everywhere.
+#[allow(clippy::unnecessary_cast)]
+pub fn raise_fd_limit(needed: u64) -> u64 {
+    let mut limit = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    // SAFETY: `limit` is a valid, writable rlimit for the duration of the call.
+    if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) } != 0 {
+        return 0;
+    }
+    let current = limit.rlim_cur as u64;
+    if current >= needed {
+        return current;
+    }
+    // Some systems cap the soft limit below the reported hard limit, so fall
+    // back to smaller requests instead of giving up.
+    for target in [needed, needed.min(61_440), needed.min(10_240)] {
+        let wanted = libc::rlimit {
+            rlim_cur: target.min(limit.rlim_max as u64) as libc::rlim_t,
+            rlim_max: limit.rlim_max,
+        };
+        // SAFETY: `wanted` is a valid rlimit; the call only changes this process's limit.
+        if unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &wanted) } == 0 {
+            return wanted.rlim_cur as u64;
+        }
+    }
+    current
+}
+
+/// Connects from an explicitly chosen local port instead of an ephemeral one.
+///
+/// macOS serves every outgoing connection of the machine from one pool of
+/// 16 384 ephemeral ports. A test that opens 10 000 client connections would
+/// leave too few for the proxy's own 10 000 connections to the DC, so on macOS
+/// the clients take their ports from below that pool.
+pub async fn connect_from_fixed_port_range(addr: SocketAddr) -> TcpStream {
+    use std::sync::atomic::{AtomicU16, Ordering};
+    static NEXT_PORT: AtomicU16 = AtomicU16::new(18_000);
+    loop {
+        let port = NEXT_PORT.fetch_add(1, Ordering::Relaxed);
+        assert!(
+            port < 49_000,
+            "ran out of local ports below the ephemeral range"
+        );
+        let socket = tokio::net::TcpSocket::new_v4().unwrap();
+        // Lets a port still in TIME_WAIT from an earlier run be used again.
+        socket.set_reuseaddr(true).unwrap();
+        if socket
+            .bind(SocketAddr::from(([127, 0, 0, 1], port)))
+            .is_err()
+        {
+            continue;
+        }
+        match socket.connect(addr).await {
+            Ok(stream) => return stream,
+            Err(err)
+                if matches!(
+                    err.kind(),
+                    std::io::ErrorKind::AddrInUse | std::io::ErrorKind::AddrNotAvailable
+                ) => {}
+            Err(err) => panic!("connect from port {port} failed: {err}"),
+        }
+    }
+}
+
+/// A client socket for tests that open thousands of connections at once.
+pub async fn connect_bulk(addr: SocketAddr) -> TcpStream {
+    if cfg!(target_os = "macos") {
+        connect_from_fixed_port_range(addr).await
+    } else {
+        TcpStream::connect(addr).await.unwrap()
+    }
 }
