@@ -156,6 +156,19 @@ fn find_sni(after_session_id: &[u8]) -> Option<&str> {
     None
 }
 
+/// SNI of any TLS ClientHello record, without the fake-tls size and version
+/// requirements. Used to pick a mask target for handshakes that failed.
+pub fn client_hello_sni(record: &[u8]) -> Option<&str> {
+    if record.len() <= SESSION_ID_LEN_POS || record[0] != TYPE_HANDSHAKE || record[5] != 0x01 {
+        return None;
+    }
+    let session_id_len = usize::from(record[SESSION_ID_LEN_POS]);
+    if session_id_len > MAX_SESSION_ID_LEN {
+        return None;
+    }
+    find_sni(record.get(SESSION_ID_POS + session_id_len..)?)
+}
+
 /// Structural parse of a full ClientHello record (header included).
 /// The SNI is best effort: mtprotoproxy never reads it, so a hello without a
 /// parseable SNI is still accepted.
@@ -774,6 +787,46 @@ mod tests {
     }
 
     #[test]
+    fn lenient_sni_reads_hellos_the_verifier_rejects() {
+        // A short TLS 1.2 style hello: 03 03 record version, 70 bytes of payload.
+        let mut body = vec![0x03, 0x03];
+        body.extend_from_slice(&[7u8; 32]);
+        body.push(0);
+        body.extend_from_slice(&[0x00, 0x02, 0x13, 0x01, 0x01, 0x00]);
+        let name = b"Probe.Example";
+        let mut sni = vec![0x00, 0x00];
+        sni.extend_from_slice(&((name.len() + 5) as u16).to_be_bytes());
+        sni.extend_from_slice(&((name.len() + 3) as u16).to_be_bytes());
+        sni.push(0);
+        sni.extend_from_slice(&(name.len() as u16).to_be_bytes());
+        sni.extend_from_slice(name);
+        body.extend_from_slice(&(sni.len() as u16).to_be_bytes());
+        body.extend_from_slice(&sni);
+
+        let mut record = vec![0x16, 0x03, 0x03];
+        record.extend_from_slice(&((body.len() + 4) as u16).to_be_bytes());
+        record.push(0x01);
+        record.extend_from_slice(&(body.len() as u32).to_be_bytes()[1..]);
+        record.extend_from_slice(&body);
+
+        assert_eq!(parse_client_hello(&record), Err(HelloError::Malformed));
+        assert_eq!(client_hello_sni(&record), Some("Probe.Example"));
+
+        assert_eq!(client_hello_sni(&[]), None);
+        assert_eq!(client_hello_sni(&record[..40]), None);
+        assert_eq!(client_hello_sni(&record[..50]), None);
+        let mut not_hello = record.clone();
+        not_hello[5] = 0x02;
+        assert_eq!(client_hello_sni(&not_hello), None);
+        let mut not_handshake = record.clone();
+        not_handshake[0] = 0x17;
+        assert_eq!(client_hello_sni(&not_handshake), None);
+        let mut long_session = record;
+        long_session[43] = 200;
+        assert_eq!(client_hello_sni(&long_session), None);
+    }
+
+    #[test]
     fn empty_session_id_is_supported() {
         let secrets = [secret(1)];
         let template = client_hello_template("www.example.com", &mut rng()).unwrap();
@@ -1045,6 +1098,8 @@ mod tests {
             }
             let _ = verify_client_hello(&record, &[secret(1)], NOW, &SKEW);
             let _ = find_sni(&data);
+            let _ = client_hello_sni(&record);
+            let _ = client_hello_sni(&data);
             let mut buf = data.clone();
             let _ = RecordReader::new().unwrap_in_place(&mut buf, data.len());
         }
