@@ -6,8 +6,9 @@ use anyhow::Context;
 use clap::Parser;
 use socket2::{Domain, Protocol, Socket, Type};
 
-use echo_mtproxy::config::{Config, Secret};
+use echo_mtproxy::config::{links_for_domains, Config, Secret};
 use echo_mtproxy::server::{self, Proxy};
+use echo_mtproxy::stats;
 
 const LISTEN_BACKLOG: i32 = 4096;
 
@@ -18,22 +19,79 @@ struct Args {
     #[arg(short, long, default_value = "config.toml")]
     config: PathBuf,
 
-    /// Print a new fake-tls secret for DOMAIN with its tg:// link, then exit.
-    #[arg(long, value_name = "DOMAIN")]
+    /// Print a new fake-tls secret with its tg:// link, then exit. With a
+    /// DOMAIN, one link for that domain. Without one, one link per domain in
+    /// the config's `mask_domains`, all sharing the new key.
+    #[arg(long, value_name = "DOMAIN", num_args = 0..=1, default_missing_value = "")]
     gen_secret: Option<String>,
 
-    /// Server address to put in the generated link.
-    #[arg(
-        long,
-        value_name = "HOST",
-        default_value = "YOUR_SERVER",
-        requires = "gen_secret"
-    )]
+    /// Print tg:// links for the secrets already in the config, one per
+    /// `mask_domains` entry, then exit.
+    #[arg(long, conflicts_with = "gen_secret")]
+    print_links: bool,
+
+    /// Server address to put in generated links.
+    #[arg(long, value_name = "HOST", default_value = "YOUR_SERVER")]
     server: String,
 
-    /// Port to put in the generated link.
-    #[arg(long, default_value_t = 443, requires = "gen_secret")]
+    /// Port to put in generated links.
+    #[arg(long, default_value_t = 443)]
     port: u16,
+}
+
+fn print_links(links: &[(String, String)]) {
+    let width = links.iter().map(|(d, _)| d.len()).max().unwrap_or(0);
+    for (domain, link) in links {
+        println!("{domain:width$}  {link}");
+    }
+}
+
+fn allowlisted_domains(config: &Config) -> anyhow::Result<Vec<String>> {
+    let domains: Vec<String> = config
+        .parsed_mask_domains()?
+        .into_iter()
+        .map(|d| d.domain)
+        .collect();
+    anyhow::ensure!(
+        !domains.is_empty(),
+        "`mask_domains` is empty; list the domains in the config or pass --gen-secret DOMAIN"
+    );
+    Ok(domains)
+}
+
+fn generate(args: &Args, domain: &str) -> anyhow::Result<()> {
+    if !domain.is_empty() {
+        let secret = Secret::generate(domain)?;
+        println!("secret: {}", secret.to_hex());
+        println!("link:   {}", secret.tg_link(&args.server, args.port));
+        return Ok(());
+    }
+    let config = Config::load(&args.config)?;
+    let domains = allowlisted_domains(&config)?;
+    let secret = Secret::generate(&domains[0])?;
+    println!("secret: {}", secret.to_hex());
+    print_links(&links_for_domains(
+        &secret,
+        domains.iter().map(String::as_str),
+        &args.server,
+        args.port,
+    )?);
+    Ok(())
+}
+
+fn print_existing(args: &Args) -> anyhow::Result<()> {
+    let config = Config::load(&args.config)?;
+    let domains = allowlisted_domains(&config)?;
+    for (index, secret) in config.parsed_secrets()?.iter().enumerate() {
+        println!("secrets[{index}]:");
+        print_links(&links_for_domains(
+            secret,
+            domains.iter().map(String::as_str),
+            &args.server,
+            args.port,
+        )?);
+    }
+    Ok(())
 }
 
 fn bind(addr: SocketAddr) -> std::io::Result<std::net::TcpListener> {
@@ -67,11 +125,11 @@ async fn shutdown_signal() {
 fn main() -> anyhow::Result<()> {
     let args = Args::parse();
 
-    if let Some(domain) = args.gen_secret {
-        let secret = Secret::generate(&domain)?;
-        println!("secret: {}", secret.to_hex());
-        println!("link:   {}", secret.tg_link(&args.server, args.port));
-        return Ok(());
+    if let Some(domain) = &args.gen_secret {
+        return generate(&args, domain);
+    }
+    if args.print_links {
+        return print_existing(&args);
     }
 
     tracing_subscriber::fmt()
@@ -98,6 +156,13 @@ fn main() -> anyhow::Result<()> {
                 .with_context(|| format!("registering {addr}"))?;
             tracing::info!(%addr, "listening");
             tokio::spawn(server::serve(listener, proxy.clone()));
+        }
+        if let Some(addr) = config.metrics_addr() {
+            let listener = tokio::net::TcpListener::bind(addr)
+                .await
+                .with_context(|| format!("binding metrics listener {addr}"))?;
+            tracing::info!(%addr, "serving /metrics");
+            tokio::spawn(stats::serve_metrics(listener, proxy.stats().clone()));
         }
         tracing::info!(
             secrets = config.secrets.len(),
