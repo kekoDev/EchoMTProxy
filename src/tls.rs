@@ -609,6 +609,20 @@ mod tests {
     }
 
     #[test]
+    fn fifteen_minute_skew_is_asymmetric_like_the_reference() {
+        // mtprotoproxy: -20 min < server_now - client_timestamp < 10 min. A client
+        // clock 15 min behind gives +900 (rejected); 15 min ahead gives -900 (accepted).
+        let secrets = [secret(1)];
+        let behind = signed_hello(&secrets[0], (NOW - 900) as u32);
+        assert_eq!(
+            verify_client_hello(&behind, &secrets, NOW, &SKEW),
+            Err(HelloError::BadTimestamp)
+        );
+        let ahead = signed_hello(&secrets[0], (NOW + 900) as u32);
+        assert!(verify_client_hello(&ahead, &secrets, NOW, &SKEW).is_ok());
+    }
+
+    #[test]
     fn uptime_timestamps_follow_the_policy() {
         let secrets = [secret(1)];
         let strict = SkewPolicy {
