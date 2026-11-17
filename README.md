@@ -87,6 +87,11 @@ text at `/metrics`:
 | `echo_mtproxy_connections_accepted_total` | | connections taken off the listeners, admitted or not |
 | `echo_mtproxy_connections_over_limit_total` | | connections refused because `max_connections` were open |
 | `echo_mtproxy_pool_buffers_in_use` | | relay buffers borrowed right now; idle sessions hold none |
+| `echo_mtproxy_relay_bytes_total` | `lane` | bytes relayed, both directions, `media` or `chat` |
+| `echo_mtproxy_egress_bits_per_second` | | relay egress over the last congestion-control tick |
+| `echo_mtproxy_congestion_scale` | | share of the media rate currently allowed (1 = no congestion) |
+| `echo_mtproxy_media_connections_throttled` | | media connections waiting on their rate limit right now |
+| `echo_mtproxy_upstream_retries_total` | `result` | DC connections reset before answering and retried: `reconnected`, `failed` |
 | `echo_mtproxy_handshakes_total` | `sni`, `result` | handshakes by outcome: `accepted`, `malformed`, `bad_digest`, `bad_timestamp`, `replay`, `bad_init`, `timeout` |
 | `echo_mtproxy_sessions_active` | `sni` | relayed sessions currently open |
 | `echo_mtproxy_mask_connections_total` | `target`, `result` | masked connections: `forwarded`, `connect_failed`, `limited` |
@@ -95,6 +100,39 @@ text at `/metrics`:
 `sni` takes only names known at startup: the `mask_domains` entries, the default
 mask host and the secrets' domains. Every other SNI is counted as `_other`, so
 clients cannot create new series.
+
+## Media limiting and congestion control
+
+Telegram clients mark media connections with a negative DC index. Those are the
+media lane; everything else is chat. **Chat is never limited.**
+
+- Each media connection may relay `media_burst_bytes` (default 10 MB) at full
+  speed, then `media_rate_bps` (default 3 Mbit/s), upload and download counted
+  together. `media_rate_bps = 0` turns limiting off.
+- A limited connection is slowed by reading from it later, so TCP backpressure
+  does the work and nothing is dropped. Once its burst is spent the kernel also
+  paces its client socket at the same rate (`SO_MAX_PACING_RATE`, Linux); the
+  pacing is lifted again when the connection has earned its full burst back.
+- `link_capacity_bps` (default 5 Gbit/s; set it to the measured real throughput
+  of your uplink) and `congestion_threshold` (default 0.85) drive congestion
+  control. Every 200 ms the proxy measures its relay egress; above
+  threshold x capacity it scales every media rate down by the same proportion
+  (to no less than 5%), and below it the scale recovers 10% per tick.
+  `link_capacity_bps = 0` turns it off.
+
+## Upstream connections
+
+- `upstream_bind_addrs` lists local source addresses for connections to
+  Telegram, rotated per address family. One source address can only hold a
+  limited number of connections to one DC address, so list every address the
+  server has. They are bound with `IP_BIND_ADDRESS_NO_PORT` (Linux) so no port
+  is reserved until connect. An address not assigned to the host fails startup.
+- If a DC connection is reset before the DC has sent anything, the proxy
+  reconnects once to the same DC over the other address family and replays the
+  handshake and the client's first payload (up to 16 KiB). The client notices
+  nothing. A reset after the DC has answered ends the session as before.
+- `listen` takes any number of addresses and ports; all share one set of
+  secrets, limits and counters.
 
 ## Limits
 
@@ -117,8 +155,10 @@ clients cannot create new series.
 echo-mtproxy --config /etc/echo-mtproxy/config.toml
 ```
 
-Logging goes to stderr; set `RUST_LOG=debug` for per-connection detail. Secrets,
-keys and client addresses are never logged.
+Logging goes to stderr; set `RUST_LOG=debug` for per-connection detail. At
+debug level every session leaves one "session ended" line: who closed it
+(`client`, `dc` or `idle`), bytes each way, duration and lane. Secrets, keys
+and client addresses are never logged.
 
 Binding port 443 needs root or `CAP_NET_BIND_SERVICE`, and every client uses two
 file descriptors, so raise the open-file limit. A systemd unit that does both:
@@ -161,6 +201,7 @@ cargo test                                   # unit, property, vector, integrati
 cargo test --test integration -- --ignored   # also talk to real Telegram DCs
 cargo test --release --test rss -- --ignored --nocapture   # memory per idle session (Linux)
 cargo bench                                  # cipher, handshake and relay benchmarks
+cargo bench --bench limiting_ab              # cost of media limiting when it never limits
 cargo test --release --test storm -- --ignored --nocapture # accept and handshake rate under a connection storm (Linux)
 ```
 
