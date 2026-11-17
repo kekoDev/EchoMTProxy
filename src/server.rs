@@ -1,5 +1,6 @@
 use std::io;
 use std::net::SocketAddr;
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -655,9 +656,16 @@ pub async fn handle_client(mut stream: TcpStream, proxy: Arc<Proxy>) {
                 }
                 Err(ended) => ended,
             };
-            if let Some(err) = ended.error {
-                tracing::debug!(error = %err, "session ended with error");
-            }
+            // No addresses: only who closed, how much moved and for how long.
+            tracing::debug!(
+                closed_by = ended.by.as_str(),
+                lane = traffic.lane.as_str(),
+                bytes_up = traffic.bytes_up.load(Ordering::Relaxed),
+                bytes_down = traffic.bytes_down.load(Ordering::Relaxed),
+                duration_ms = traffic.duration().as_millis() as u64,
+                error = ended.error.as_ref().map(tracing::field::display),
+                "session ended"
+            );
         }
         Next::Mask(bytes) => {
             let (target, result) = Box::pin(proxy.masker.forward(&stream, bytes)).await;
