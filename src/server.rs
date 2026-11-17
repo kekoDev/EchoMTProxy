@@ -1,4 +1,5 @@
 use std::io;
+use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -8,13 +9,14 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Semaphore;
 use tokio::time::Instant;
 
-use crate::cipher::Ctr;
+use crate::cipher::{AesCtr, Ctr};
 use crate::config::{Config, Secret, UpstreamMode};
 use crate::dc::DcTable;
 use crate::limit::{Direction, Lane, Limits, SessionTraffic};
 use crate::mask::Masker;
 use crate::obfs2::{self, ClientInit, InitError, INIT_LEN, TAG_SECURE};
-use crate::relay::{relay, Ciphers};
+use crate::pool;
+use crate::relay::{relay, Ciphers, ClosedBy, Ended};
 use crate::replay::ReplayCache;
 use crate::stats::{HandshakeResult, MaskResult, Stats};
 use crate::tls::{
@@ -61,6 +63,9 @@ impl Proxy {
         let mut dc = DcTable::new(config.prefer_ipv6_upstream);
         for (index, addr) in config.parsed_dc_overrides()? {
             dc = dc.with_override(index, addr);
+        }
+        for (index, addr) in config.parsed_dc_overrides_v6()? {
+            dc = dc.with_override_v6(index, addr);
         }
         let dc = dc.with_bind_addrs(&config.upstream_bind_addrs)?;
         let secrets = config.parsed_secrets()?;
@@ -167,8 +172,46 @@ struct Established {
     ciphers: Ciphers,
     label: usize,
     lane: Lane,
-    /// Client payload already sent upstream together with the handshake.
-    early_bytes: usize,
+    /// What is needed to start over on the other address family, kept until
+    /// the DC's first byte arrives.
+    early: Box<Early>,
+}
+
+/// State for retrying the upstream connection. A DC connection can be reset
+/// (by the DC or by something on the path) before the DC has answered at all;
+/// nothing has reached the client yet at that point, so the upstream side can
+/// be rebuilt from scratch on the other address family.
+struct Early {
+    dc_idx: i16,
+    /// The DC address the current upstream connection uses.
+    used: SocketAddr,
+    /// The client's proxy→client key and IV, for the fast-mode upstream init.
+    enc_key: [u8; 32],
+    enc_iv: [u8; 16],
+    /// Client payload sent upstream so far, decrypted, to be replayed.
+    sent: Vec<u8>,
+    /// Bytes of client payload sent upstream so far.
+    sent_len: usize,
+    /// The client has sent more than is kept; a retry is no longer possible.
+    overflow: bool,
+}
+
+/// Client payload kept for a retry. A client's first flight is well under this.
+const EARLY_DATA_LIMIT: usize = 16 * 1024;
+
+impl Early {
+    fn remember(&mut self, plain: &[u8]) {
+        self.sent_len += plain.len();
+        if self.overflow {
+            return;
+        }
+        if self.sent.len() + plain.len() > EARLY_DATA_LIMIT {
+            self.overflow = true;
+            self.sent = Vec::new();
+        } else {
+            self.sent.extend_from_slice(plain);
+        }
+    }
 }
 
 /// What to do with a connection once everything before the relay is settled.
@@ -265,16 +308,40 @@ async fn drain(stream: &mut TcpStream) {
     while matches!(stream.read(&mut buf).await, Ok(n) if n > 0) {}
 }
 
+/// The bytes that open an upstream connection in the configured mode, with
+/// the upstream-side ciphers that go with them.
+fn upstream_handshake(
+    mode: UpstreamMode,
+    enc_key: &[u8; 32],
+    enc_iv: &[u8; 16],
+) -> (Vec<u8>, Option<Box<AesCtr>>, Option<Box<AesCtr>>) {
+    match mode {
+        UpstreamMode::Fast => {
+            let up = obfs2::upstream_init(obfs2::random_init_seed(), Some((enc_key, enc_iv)));
+            (up.wire.to_vec(), Some(Box::new(up.enc)), None)
+        }
+        UpstreamMode::Obfuscated => {
+            let up = obfs2::upstream_init(obfs2::random_init_seed(), None);
+            (
+                up.wire.to_vec(),
+                Some(Box::new(up.enc)),
+                Some(Box::new(up.dec)),
+            )
+        }
+        UpstreamMode::Plain => (TAG_SECURE.to_vec(), None, None),
+    }
+}
+
 /// Connects to the DC and sends the upstream handshake together with any
 /// client payload that arrived behind the init.
 async fn connect_upstream(
     session: Session,
     proxy: &Proxy,
-) -> io::Result<(TcpStream, RecordReader, Ciphers, usize)> {
+) -> io::Result<(TcpStream, RecordReader, Ciphers, Box<Early>)> {
     let Session {
         init,
         records,
-        leftover,
+        mut leftover,
     } = session;
     let ClientInit {
         dec: client_dec,
@@ -284,36 +351,26 @@ async fn connect_upstream(
     } = init;
     let mut client_dec = Box::new(client_dec);
 
-    let mut upstream = proxy.dc.connect(dc_idx).await?;
+    let (mut upstream, used) = proxy.dc.connect(dc_idx).await?;
+    let (mut first, mut upstream_enc, upstream_dec) =
+        upstream_handshake(proxy.upstream_mode, &keys.enc_key, &keys.enc_iv);
+    // Fast mode leaves the DC's bytes untouched, so nothing encrypts for the client.
+    let client_enc = (proxy.upstream_mode != UpstreamMode::Fast).then(|| Box::new(client_enc));
 
-    let mut first = Vec::with_capacity(INIT_LEN + leftover.len());
-    let (mut upstream_enc, upstream_dec, client_enc) = match proxy.upstream_mode {
-        UpstreamMode::Fast => {
-            let up = obfs2::upstream_init(
-                obfs2::random_init_seed(),
-                Some((&keys.enc_key, &keys.enc_iv)),
-            );
-            first.extend_from_slice(&up.wire);
-            (Some(Box::new(up.enc)), None, None)
-        }
-        UpstreamMode::Obfuscated => {
-            let up = obfs2::upstream_init(obfs2::random_init_seed(), None);
-            first.extend_from_slice(&up.wire);
-            (
-                Some(Box::new(up.enc)),
-                Some(Box::new(up.dec)),
-                Some(Box::new(client_enc)),
-            )
-        }
-        UpstreamMode::Plain => {
-            first.extend_from_slice(&TAG_SECURE);
-            (None, None, Some(Box::new(client_enc)))
-        }
-    };
+    client_dec.apply(&mut leftover);
+    let mut early = Box::new(Early {
+        dc_idx,
+        used,
+        enc_key: keys.enc_key,
+        enc_iv: keys.enc_iv,
+        sent: Vec::new(),
+        sent_len: 0,
+        overflow: false,
+    });
+    early.remember(&leftover);
 
     let header_len = first.len();
     first.extend_from_slice(&leftover);
-    client_dec.apply(&mut first[header_len..]);
     if let Some(enc) = upstream_enc.as_mut() {
         enc.apply(&mut first[header_len..]);
     }
@@ -328,8 +385,167 @@ async fn connect_upstream(
             upstream_dec,
             client_enc,
         },
-        leftover.len(),
+        early,
     ))
+}
+
+fn is_reset(err: &io::Error) -> bool {
+    matches!(
+        err.kind(),
+        io::ErrorKind::ConnectionReset
+            | io::ErrorKind::ConnectionAborted
+            | io::ErrorKind::BrokenPipe
+    )
+}
+
+/// Opens a fresh upstream connection on the other address family and replays
+/// the handshake and the client's payload so far.
+async fn reconnect_upstream(session: &mut Established, proxy: &Proxy) -> io::Result<()> {
+    let early = &mut session.early;
+    let (mut upstream, used) = proxy
+        .dc
+        .connect_other_family(early.dc_idx, early.used)
+        .await?;
+    let (mut first, mut upstream_enc, upstream_dec) =
+        upstream_handshake(proxy.upstream_mode, &early.enc_key, &early.enc_iv);
+    let header_len = first.len();
+    first.extend_from_slice(&early.sent);
+    if let Some(enc) = upstream_enc.as_mut() {
+        enc.apply(&mut first[header_len..]);
+    }
+    upstream.write_all(&first).await?;
+
+    early.used = used;
+    session.ciphers.upstream_enc = upstream_enc;
+    session.ciphers.upstream_dec = upstream_dec;
+    session.upstream = upstream;
+    Ok(())
+}
+
+/// What the DC side did while its first byte was awaited.
+enum DcEvent {
+    Data,
+    Closed,
+    Failed(io::Error),
+}
+
+async fn dc_event(upstream: &TcpStream) -> DcEvent {
+    let mut probe = [0u8; 1];
+    // Peeking leaves the byte for the relay to read.
+    match upstream.peek(&mut probe).await {
+        Ok(0) => DcEvent::Closed,
+        Ok(_) => DcEvent::Data,
+        Err(err) => DcEvent::Failed(err),
+    }
+}
+
+/// Forwards one read from the client to the DC, remembering it for a retry.
+/// Returns `Ok(false)` when the client has closed.
+async fn forward_early(
+    client: &TcpStream,
+    session: &mut Established,
+    traffic: &SessionTraffic<'_>,
+) -> Result<bool, (ClosedBy, io::Error)> {
+    let mut buf = pool::take();
+    let n = match client.try_read(&mut buf) {
+        Ok(0) => return Ok(false),
+        Ok(n) => n,
+        Err(err) if err.kind() == io::ErrorKind::WouldBlock => return Ok(true),
+        Err(err) => return Err((ClosedBy::Client, err)),
+    };
+    let len = session.records.unwrap_in_place(&mut buf, n).map_err(|e| {
+        (
+            ClosedBy::Client,
+            io::Error::new(io::ErrorKind::InvalidData, e),
+        )
+    })?;
+    if len == 0 {
+        return Ok(true);
+    }
+    let payload = &mut buf[..len];
+    session.ciphers.client_dec.apply(payload);
+    session.early.remember(payload);
+    if let Some(enc) = session.ciphers.upstream_enc.as_mut() {
+        enc.apply(payload);
+    }
+    let _ = traffic.account(Direction::Up, len);
+    crate::relay::write_all(&session.upstream, payload)
+        .await
+        .map_err(|err| (ClosedBy::Dc, err))?;
+    Ok(true)
+}
+
+/// Runs the session until the DC's first byte is waiting to be read.
+///
+/// Until then nothing from the DC has reached the client, so if the DC
+/// connection is reset it is rebuilt once on the other address family.
+/// Returns `Err` with how the session ended if it did not get that far.
+async fn await_first_response(
+    client: &TcpStream,
+    session: &mut Established,
+    proxy: &Proxy,
+    traffic: &SessionTraffic<'_>,
+) -> Result<(), Ended> {
+    let mut retried = false;
+    loop {
+        let idle = async {
+            match proxy.idle_timeout {
+                Some(idle) => tokio::time::sleep(idle).await,
+                None => std::future::pending().await,
+            }
+        };
+        let failure = tokio::select! {
+            event = dc_event(&session.upstream) => match event {
+                DcEvent::Data => return Ok(()),
+                DcEvent::Closed => return Err(Ended { by: ClosedBy::Dc, error: None }),
+                DcEvent::Failed(err) => err,
+            },
+            ready = client.readable() => {
+                if let Err(err) = ready {
+                    return Err(Ended { by: ClosedBy::Client, error: Some(err) });
+                }
+                match forward_early(client, session, traffic).await {
+                    Ok(true) => continue,
+                    Ok(false) => return Err(Ended { by: ClosedBy::Client, error: None }),
+                    Err((ClosedBy::Dc, err)) => err,
+                    Err((by, err)) => return Err(Ended { by, error: Some(err) }),
+                }
+            }
+            () = idle => return Err(Ended { by: ClosedBy::Idle, error: None }),
+        };
+
+        // The DC side failed before answering.
+        let retryable = is_reset(&failure)
+            && !retried
+            && !session.early.overflow
+            && proxy
+                .dc
+                .other_family(session.early.dc_idx, session.early.used)
+                .is_some();
+        if !retryable {
+            return Err(Ended {
+                by: ClosedBy::Dc,
+                error: Some(failure),
+            });
+        }
+        retried = true;
+        match reconnect_upstream(session, proxy).await {
+            Ok(()) => {
+                proxy.stats.record_upstream_retry(true);
+                tracing::debug!(
+                    dc = session.early.dc_idx,
+                    "upstream reset before answering; retried on the other address family"
+                );
+            }
+            Err(err) => {
+                proxy.stats.record_upstream_retry(false);
+                return Err(Ended {
+                    by: ClosedBy::Dc,
+                    error: Some(err),
+                });
+            }
+        }
+    }
 }
 
 /// Everything up to the relay: handshake, accounting and the upstream connect.
@@ -345,13 +561,13 @@ async fn negotiate(stream: &mut TcpStream, proxy: &Proxy, deadline: Instant) -> 
             drop(seen);
             let dc_idx = session.init.dc_idx;
             return match connect_upstream(session, proxy).await {
-                Ok((upstream, records, ciphers, early_bytes)) => Next::Relay(Established {
+                Ok((upstream, records, ciphers, early)) => Next::Relay(Established {
                     upstream,
                     records,
                     ciphers,
                     label,
                     lane: Lane::from_dc_idx(dc_idx),
-                    early_bytes,
+                    early,
                 }),
                 Err(err) => {
                     tracing::debug!(dc = dc_idx, error = %err, "upstream connect failed");
@@ -403,20 +619,42 @@ pub async fn handle_client(mut stream: TcpStream, proxy: Arc<Proxy>) {
 
     let next = Box::pin(negotiate(&mut stream, &proxy, deadline)).await;
     match next {
-        Next::Relay(session) => {
+        Next::Relay(mut session) => {
             let _active = proxy.stats.session_started(session.label);
             let traffic = SessionTraffic::new(session.lane, &proxy.stats.limits, &stream);
             // Counted and charged like any relayed bytes; too small to wait for.
-            let _ = traffic.account(Direction::Up, session.early_bytes);
-            let ended = relay(
+            let _ = traffic.account(Direction::Up, session.early.sent_len);
+            let first = Box::pin(await_first_response(
                 &stream,
-                &session.upstream,
-                session.records,
-                session.ciphers,
-                proxy.idle_timeout,
+                &mut session,
+                &proxy,
                 &traffic,
-            )
+            ))
             .await;
+            // The retry state, with the client's first payload, is not needed
+            // once the DC has answered.
+            let Established {
+                upstream,
+                records,
+                ciphers,
+                early,
+                ..
+            } = session;
+            drop(early);
+            let ended = match first {
+                Ok(()) => {
+                    relay(
+                        &stream,
+                        &upstream,
+                        records,
+                        ciphers,
+                        proxy.idle_timeout,
+                        &traffic,
+                    )
+                    .await
+                }
+                Err(ended) => ended,
+            };
             if let Some(err) = ended.error {
                 tracing::debug!(error = %err, "session ended with error");
             }

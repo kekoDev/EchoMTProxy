@@ -252,6 +252,8 @@ pub struct Config {
     pub cipher_backend: CipherBackend,
     /// DC id ("1".."5") to upstream address.
     pub dc_override: BTreeMap<String, SocketAddr>,
+    /// DC id to an address for its IPv6 side only.
+    pub dc_override_v6: BTreeMap<String, SocketAddr>,
 }
 
 impl Default for Config {
@@ -285,6 +287,7 @@ impl Default for Config {
             metrics_listen: "127.0.0.1:9100".to_owned(),
             cipher_backend: CipherBackend::Rustcrypto,
             dc_override: BTreeMap::new(),
+            dc_override_v6: BTreeMap::new(),
         }
     }
 }
@@ -320,6 +323,7 @@ impl Config {
         );
         let secrets = config.parsed_secrets()?;
         config.parsed_dc_overrides()?;
+        config.parsed_dc_overrides_v6()?;
         config.parsed_mask_domains()?;
         config.default_mask(&secrets)?;
         if !config.metrics_listen.is_empty() {
@@ -406,7 +410,18 @@ impl Config {
 
     /// Overrides as (zero-based DC index, address).
     pub fn parsed_dc_overrides(&self) -> anyhow::Result<Vec<(usize, SocketAddr)>> {
-        self.dc_override
+        Self::parse_dc_table(&self.dc_override)
+    }
+
+    /// IPv6-side overrides as (zero-based DC index, address).
+    pub fn parsed_dc_overrides_v6(&self) -> anyhow::Result<Vec<(usize, SocketAddr)>> {
+        Self::parse_dc_table(&self.dc_override_v6)
+    }
+
+    fn parse_dc_table(
+        table: &BTreeMap<String, SocketAddr>,
+    ) -> anyhow::Result<Vec<(usize, SocketAddr)>> {
+        table
             .iter()
             .map(|(id, addr)| match id.parse::<usize>() {
                 Ok(n @ 1..=5) => Ok((n - 1, *addr)),
@@ -744,5 +759,12 @@ mod tests {
         );
         assert!(Config::parse(&format!("{base}[dc_override]\n6 = \"127.0.0.1:1\"")).is_err());
         assert!(Config::parse(&format!("{base}[dc_override]\nx = \"127.0.0.1:1\"")).is_err());
+
+        let config = Config::parse(&format!("{base}[dc_override_v6]\n3 = \"[::1]:1444\"")).unwrap();
+        assert_eq!(
+            config.parsed_dc_overrides_v6().unwrap(),
+            vec![(2, "[::1]:1444".parse().unwrap())]
+        );
+        assert!(Config::parse(&format!("{base}[dc_override_v6]\n0 = \"[::1]:1\"")).is_err());
     }
 }

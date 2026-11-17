@@ -1156,3 +1156,230 @@ async fn unassigned_upstream_bind_addr_fails_at_startup() {
         .expect("startup should fail");
     assert!(format!("{err:#}").contains("192.0.2.77"), "{err:#}");
 }
+
+/// Length of the upstream handshake in the obfuscated modes.
+const INIT: usize = 64;
+
+/// A DC that reads `swallow` bytes, then resets the connection without ever
+/// answering. Counts the connections it received.
+async fn spawn_resetting_dc(
+    bind: &str,
+    swallow: usize,
+) -> (SocketAddr, Arc<std::sync::atomic::AtomicUsize>) {
+    let listener = TcpListener::bind(bind).await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let counter = hits.clone();
+    tokio::spawn(async move {
+        loop {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            tokio::spawn(async move {
+                let mut buf = vec![0u8; swallow];
+                let _ = stream.read_exact(&mut buf).await;
+                socket2::SockRef::from(&stream)
+                    .set_linger(Some(Duration::ZERO))
+                    .unwrap();
+                drop(stream);
+            });
+        }
+    });
+    (addr, hits)
+}
+
+async fn spawn_echo_dc_at(bind: &str) -> SocketAddr {
+    let listener = TcpListener::bind(bind).await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        loop {
+            let (stream, _) = listener.accept().await.unwrap();
+            tokio::spawn(async move {
+                let _ = echo_dc_session(stream, true).await;
+            });
+        }
+    });
+    addr
+}
+
+/// Proxy whose DC 2 is `v4` on the IPv4 side and `v6` on the IPv6 side.
+async fn spawn_two_family_proxy(
+    mode: &str,
+    prefer_ipv6: bool,
+    v4: SocketAddr,
+    v6: SocketAddr,
+) -> (SocketAddr, Arc<Proxy>) {
+    let blackhole = spawn_blackhole().await;
+    spawn_proxy_handle(&format!(
+        "secrets = [\"{SECRET_HEX}\"]\n\
+         upstream_mode = \"{mode}\"\n\
+         prefer_ipv6_upstream = {prefer_ipv6}\n\
+         mask_host = \"{blackhole}\"\n\
+         metrics_listen = \"\"\n\
+         [dc_override]\n\
+         {DC} = \"{v4}\"\n\
+         [dc_override_v6]\n\
+         {DC} = \"{v6}\"\n"
+    ))
+    .await
+}
+
+#[tokio::test]
+async fn dc_reset_before_first_byte_is_retried_on_the_other_family() {
+    use std::sync::atomic::Ordering;
+    for mode in ["fast", "obfuscated", "plain"] {
+        // IPv4 side resets right after the upstream handshake (a 4-byte tag
+        // in plain mode); IPv6 side works.
+        let handshake = if mode == "plain" { 4 } else { INIT };
+        let (bad, bad_hits) = spawn_resetting_dc("127.0.0.1:0", handshake).await;
+        let good = if mode == "plain" {
+            let listener = TcpListener::bind("[::1]:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            tokio::spawn(async move {
+                loop {
+                    let (stream, _) = listener.accept().await.unwrap();
+                    tokio::spawn(async move {
+                        let _ = echo_dc_session(stream, false).await;
+                    });
+                }
+            });
+            addr
+        } else {
+            spawn_echo_dc_at("[::1]:0").await
+        };
+        let (proxy, handle) = spawn_two_family_proxy(mode, false, bad, good).await;
+
+        let mut client = Client::connect(proxy, DC).await;
+        let data = random_bytes(3000);
+        assert!(client.echo(&data).await == data, "{mode}");
+        // The session keeps working after the switch.
+        let more = random_bytes(50_000);
+        assert!(client.echo(&more).await == more, "{mode}");
+
+        assert_eq!(bad_hits.load(Ordering::Relaxed), 1, "{mode}");
+        assert_eq!(handle.stats().upstream_retries(), (1, 0), "{mode}");
+    }
+}
+
+#[tokio::test]
+async fn retry_replays_what_the_client_already_sent() {
+    use std::sync::atomic::Ordering;
+    // The IPv6 side (preferred here) swallows the init and the client's first
+    // 2000 bytes before resetting, so those bytes must be sent again.
+    let (bad, bad_hits) = spawn_resetting_dc("[::1]:0", INIT + 2000).await;
+    let good = spawn_echo_dc_at("127.0.0.1:0").await;
+    let (proxy, handle) = spawn_two_family_proxy("fast", true, good, bad).await;
+
+    let mut client = Client::connect(proxy, DC).await;
+    let data = random_bytes(2000);
+    assert!(client.echo(&data).await == data);
+    assert_eq!(bad_hits.load(Ordering::Relaxed), 1);
+    assert_eq!(handle.stats().upstream_retries(), (1, 0));
+
+    // Data sent in several pieces before the reset is replayed in order.
+    let mut client = Client::connect(proxy, DC).await;
+    let data = random_bytes(2000);
+    for piece in data.chunks(500) {
+        client.send(piece).await;
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(client.recv(2000).await == data);
+    assert_eq!(handle.stats().upstream_retries(), (2, 0));
+}
+
+#[tokio::test]
+async fn only_one_retry_is_made() {
+    use std::sync::atomic::Ordering;
+    let (bad4, hits4) = spawn_resetting_dc("127.0.0.1:0", INIT).await;
+    let (bad6, hits6) = spawn_resetting_dc("[::1]:0", INIT).await;
+    let (proxy, handle) = spawn_two_family_proxy("fast", false, bad4, bad6).await;
+
+    let mut client = Client::connect(proxy, DC).await;
+    client.send(b"hello").await;
+    let mut buf = [0u8; 8];
+    let read = timeout(STEP, client.read.read(&mut buf)).await.unwrap();
+    assert!(matches!(read, Ok(0) | Err(_)), "client was not closed");
+    assert_eq!(hits4.load(Ordering::Relaxed), 1);
+    assert_eq!(hits6.load(Ordering::Relaxed), 1);
+    // The reconnect itself worked; the second reset is not retried.
+    assert_eq!(handle.stats().upstream_retries(), (1, 0));
+}
+
+#[tokio::test]
+async fn failed_reconnect_is_counted_and_closes_the_client() {
+    let (bad4, _) = spawn_resetting_dc("127.0.0.1:0", INIT).await;
+    let dead6 = {
+        let listener = TcpListener::bind("[::1]:0").await.unwrap();
+        listener.local_addr().unwrap()
+    };
+    let (proxy, handle) = spawn_two_family_proxy("fast", false, bad4, dead6).await;
+
+    let mut client = Client::connect(proxy, DC).await;
+    client.send(b"hello").await;
+    let mut buf = [0u8; 8];
+    let read = timeout(STEP, client.read.read(&mut buf)).await.unwrap();
+    assert!(matches!(read, Ok(0) | Err(_)));
+    assert_eq!(handle.stats().upstream_retries(), (0, 1));
+}
+
+#[tokio::test]
+async fn no_retry_without_another_family_or_after_too_much_data() {
+    use std::sync::atomic::Ordering;
+    // One address for both families: nowhere to retry.
+    let (bad, hits) = spawn_resetting_dc("127.0.0.1:0", INIT).await;
+    let (proxy, handle) = spawn_proxy_handle(&format!(
+        "secrets = [\"{SECRET_HEX}\"]\nmetrics_listen = \"\"\n[dc_override]\n{DC} = \"{bad}\"\n"
+    ))
+    .await;
+    let mut client = Client::connect(proxy, DC).await;
+    client.send(b"hello").await;
+    let mut buf = [0u8; 8];
+    let read = timeout(STEP, client.read.read(&mut buf)).await.unwrap();
+    assert!(matches!(read, Ok(0) | Err(_)));
+    assert_eq!(hits.load(Ordering::Relaxed), 1);
+    assert_eq!(handle.stats().upstream_retries(), (0, 0));
+
+    // More than 16 KiB sent before the reset: the proxy no longer has it all.
+    let (bad, hits) = spawn_resetting_dc("127.0.0.1:0", INIT + 40_000).await;
+    let good = spawn_echo_dc_at("[::1]:0").await;
+    let (proxy, handle) = spawn_two_family_proxy("fast", false, bad, good).await;
+    let mut client = Client::connect(proxy, DC).await;
+    client.send(&random_bytes(40_000)).await;
+    let read = timeout(STEP, client.read.read(&mut buf)).await.unwrap();
+    assert!(matches!(read, Ok(0) | Err(_)), "session should have ended");
+    assert_eq!(hits.load(Ordering::Relaxed), 1);
+    assert_eq!(handle.stats().upstream_retries(), (0, 0));
+}
+
+#[tokio::test]
+async fn reset_after_the_dc_has_answered_is_not_retried() {
+    use std::sync::atomic::Ordering;
+    // Answers one echo, then resets.
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let answering = listener.local_addr().unwrap();
+    let hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let counter = hits.clone();
+    tokio::spawn(async move {
+        loop {
+            let (stream, _) = listener.accept().await.unwrap();
+            counter.fetch_add(1, Ordering::Relaxed);
+            tokio::spawn(async move {
+                let reset = socket2::SockRef::from(&stream).try_clone().unwrap();
+                let _ = timeout(Duration::from_millis(400), echo_dc_session(stream, true)).await;
+                let _ = reset.set_linger(Some(Duration::ZERO));
+            });
+        }
+    });
+    let good = spawn_echo_dc_at("[::1]:0").await;
+    let (proxy, handle) = spawn_two_family_proxy("fast", false, answering, good).await;
+
+    let mut client = Client::connect(proxy, DC).await;
+    assert_eq!(client.echo(b"first").await, b"first");
+    let mut buf = [0u8; 8];
+    let read = timeout(STEP, client.read.read(&mut buf)).await.unwrap();
+    assert!(
+        matches!(read, Ok(0) | Err(_)),
+        "client should be closed by the DC reset"
+    );
+    assert_eq!(hits.load(Ordering::Relaxed), 1);
+    assert_eq!(handle.stats().upstream_retries(), (0, 0));
+}

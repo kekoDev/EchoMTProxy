@@ -32,7 +32,6 @@ const DC_V6: [Ipv6Addr; DC_COUNT] = [
 pub struct DcTable {
     v4: [SocketAddr; DC_COUNT],
     v6: [SocketAddr; DC_COUNT],
-    overridden: [bool; DC_COUNT],
     prefer_v6: bool,
     /// Local source addresses for upstream connections, by family.
     bind_v4: Vec<IpAddr>,
@@ -46,7 +45,6 @@ impl DcTable {
         Self {
             v4: DC_V4.map(|ip| SocketAddr::new(IpAddr::V4(ip), DC_PORT)),
             v6: DC_V6.map(|ip| SocketAddr::new(IpAddr::V6(ip), DC_PORT)),
-            overridden: [false; DC_COUNT],
             prefer_v6,
             bind_v4: Vec::new(),
             bind_v6: Vec::new(),
@@ -55,14 +53,28 @@ impl DcTable {
         }
     }
 
-    /// Replaces both address families of a DC (zero-based index) with one address.
+    /// Replaces both address families of a DC (zero-based index) with one
+    /// address. Such a DC has no "other family" to fall back or retry on.
     pub fn with_override(mut self, index: usize, addr: SocketAddr) -> Self {
         if index < DC_COUNT {
             self.v4[index] = addr;
             self.v6[index] = addr;
-            self.overridden[index] = true;
         }
         self
+    }
+
+    /// Replaces only the IPv6-side address of a DC (zero-based index).
+    pub fn with_override_v6(mut self, index: usize, addr: SocketAddr) -> Self {
+        if index < DC_COUNT {
+            self.v6[index] = addr;
+        }
+        self
+    }
+
+    fn index(dc_idx: i16) -> Option<usize> {
+        usize::from(dc_idx.unsigned_abs())
+            .checked_sub(1)
+            .filter(|index| *index < DC_COUNT)
     }
 
     /// Source addresses to connect to DCs from, used in rotation per family.
@@ -108,11 +120,8 @@ impl DcTable {
     /// Addresses to try, in order, for the DC index sent by the client.
     /// Negative indexes are media DCs; direct mode uses the same address.
     pub fn candidates(&self, dc_idx: i16) -> Option<(SocketAddr, Option<SocketAddr>)> {
-        let index = usize::from(dc_idx.unsigned_abs()).checked_sub(1)?;
-        if index >= DC_COUNT {
-            return None;
-        }
-        if self.overridden[index] {
+        let index = Self::index(dc_idx)?;
+        if self.v4[index] == self.v6[index] {
             Some((self.v4[index], None))
         } else if self.prefer_v6 {
             Some((self.v6[index], Some(self.v4[index])))
@@ -121,17 +130,44 @@ impl DcTable {
         }
     }
 
-    pub async fn connect(&self, dc_idx: i16) -> io::Result<TcpStream> {
+    /// Connects to a DC and returns the stream with the address that worked.
+    pub async fn connect(&self, dc_idx: i16) -> io::Result<(TcpStream, SocketAddr)> {
         let (first, fallback) = self.candidates(dc_idx).ok_or_else(|| {
             io::Error::new(io::ErrorKind::InvalidInput, "unknown datacenter index")
         })?;
         match self.connect_one(first).await {
-            Ok(stream) => Ok(stream),
+            Ok(stream) => Ok((stream, first)),
             Err(err) => match fallback {
-                Some(addr) => self.connect_one(addr).await,
+                Some(addr) => Ok((self.connect_one(addr).await?, addr)),
                 None => Err(err),
             },
         }
+    }
+
+    /// The same DC's address in the other address family than `used`.
+    pub fn other_family(&self, dc_idx: i16, used: SocketAddr) -> Option<SocketAddr> {
+        let index = Self::index(dc_idx)?;
+        let other = if used == self.v6[index] {
+            self.v4[index]
+        } else {
+            self.v6[index]
+        };
+        (other != used).then_some(other)
+    }
+
+    /// Connects to the same DC over the other address family than `used`.
+    pub async fn connect_other_family(
+        &self,
+        dc_idx: i16,
+        used: SocketAddr,
+    ) -> io::Result<(TcpStream, SocketAddr)> {
+        let other = self.other_family(dc_idx, used).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::Unsupported,
+                "datacenter has no other address family",
+            )
+        })?;
+        Ok((self.connect_one(other).await?, other))
     }
 
     /// A socket for a connection to `addr`, bound to the next source address
@@ -310,8 +346,9 @@ mod tests {
     ) -> Vec<IpAddr> {
         let mut seen = Vec::new();
         for _ in 0..count {
-            let (stream, accepted) = tokio::join!(table.connect(1), listener.accept());
-            stream.unwrap();
+            let (connected, accepted) = tokio::join!(table.connect(1), listener.accept());
+            let (_stream, used) = connected.unwrap();
+            assert_eq!(used, listener.local_addr().unwrap());
             seen.push(accepted.unwrap().1.ip());
         }
         seen
@@ -390,5 +427,56 @@ mod tests {
         let local = stream.unwrap().local_addr().unwrap();
         assert_ne!(local.port(), 0);
         assert_eq!(accepted.unwrap().1, local);
+    }
+
+    #[test]
+    fn other_family_is_the_same_dc_on_the_other_side() {
+        let table = DcTable::new(true);
+        let v4: SocketAddr = "149.154.167.51:443".parse().unwrap();
+        let v6: SocketAddr = "[2001:67c:4e8:f002::a]:443".parse().unwrap();
+        assert_eq!(table.other_family(2, v6), Some(v4));
+        assert_eq!(table.other_family(2, v4), Some(v6));
+        assert_eq!(table.other_family(-2, v4), Some(v6));
+        assert_eq!(table.other_family(0, v4), None);
+        assert_eq!(table.other_family(9, v4), None);
+
+        // One address for both families: nothing to switch to.
+        let only: SocketAddr = "127.0.0.1:1443".parse().unwrap();
+        let table = DcTable::new(true).with_override(1, only);
+        assert_eq!(table.other_family(2, only), None);
+
+        // A separate v6-side override restores the pair.
+        let six: SocketAddr = "[::1]:1444".parse().unwrap();
+        let table = table.with_override_v6(1, six).with_override_v6(9, six);
+        assert_eq!(table.other_family(2, only), Some(six));
+        assert_eq!(table.other_family(2, six), Some(only));
+        assert_eq!(table.candidates(2), Some((six, Some(only))));
+        assert_eq!(
+            DcTable::new(false)
+                .with_override(1, only)
+                .with_override_v6(1, six)
+                .candidates(2),
+            Some((only, None))
+        );
+    }
+
+    #[tokio::test]
+    async fn connect_other_family_reaches_the_other_address() {
+        let four = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let six = tokio::net::TcpListener::bind("[::1]:0").await.unwrap();
+        let (four_addr, six_addr) = (four.local_addr().unwrap(), six.local_addr().unwrap());
+        let table = DcTable::new(false)
+            .with_override(0, four_addr)
+            .with_override_v6(0, six_addr);
+
+        let (first, _) = tokio::join!(table.connect(1), four.accept());
+        let (_stream, used) = first.unwrap();
+        assert_eq!(used, four_addr);
+        let (second, _) = tokio::join!(table.connect_other_family(1, used), six.accept());
+        assert_eq!(second.unwrap().1, six_addr);
+
+        let single = DcTable::new(false).with_override(0, four_addr);
+        let err = single.connect_other_family(1, four_addr).await.unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::Unsupported);
     }
 }

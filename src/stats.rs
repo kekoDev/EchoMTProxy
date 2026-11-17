@@ -138,6 +138,8 @@ pub struct Stats {
     connections_open: AtomicU64,
     connections_over_limit: AtomicU64,
     connections_accepted: AtomicU64,
+    upstream_retries_ok: AtomicU64,
+    upstream_retries_failed: AtomicU64,
     /// Lane byte counters, media limits and the congestion scale.
     pub limits: Limits,
 }
@@ -197,6 +199,8 @@ impl Stats {
             connections_open: AtomicU64::new(0),
             connections_over_limit: AtomicU64::new(0),
             connections_accepted: AtomicU64::new(0),
+            upstream_retries_ok: AtomicU64::new(0),
+            upstream_retries_failed: AtomicU64::new(0),
             limits,
         }
     }
@@ -222,6 +226,25 @@ impl Stats {
     /// Every connection taken off a listener, admitted or not.
     pub fn connections_accepted(&self) -> u64 {
         self.connections_accepted.load(Ordering::Relaxed)
+    }
+
+    /// Counts one reconnect over the other address family after a DC reset
+    /// the connection before answering.
+    pub fn record_upstream_retry(&self, reconnected: bool) {
+        let counter = if reconnected {
+            &self.upstream_retries_ok
+        } else {
+            &self.upstream_retries_failed
+        };
+        counter.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// (reconnected, failed to reconnect)
+    pub fn upstream_retries(&self) -> (u64, u64) {
+        (
+            self.upstream_retries_ok.load(Ordering::Relaxed),
+            self.upstream_retries_failed.load(Ordering::Relaxed),
+        )
     }
 
     pub fn connections_over_limit(&self) -> u64 {
@@ -317,6 +340,16 @@ impl Stats {
             self.connections_accepted(),
             self.connections_over_limit()
         )?;
+        let (retried, retry_failed) = self.upstream_retries();
+        writeln!(
+            out,
+            "# HELP echo_mtproxy_upstream_retries_total DC connections reset before the \
+             DC's first byte and retried over the other address family.\n\
+             # TYPE echo_mtproxy_upstream_retries_total counter\n\
+             echo_mtproxy_upstream_retries_total{{result=\"reconnected\"}} {retried}\n\
+             echo_mtproxy_upstream_retries_total{{result=\"failed\"}} {retry_failed}"
+        )?;
+
         out.push_str(
             "# HELP echo_mtproxy_handshakes_total Client handshakes by SNI and outcome.\n\
              # TYPE echo_mtproxy_handshakes_total counter\n",
