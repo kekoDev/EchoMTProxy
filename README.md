@@ -3,9 +3,10 @@
 High-performance MTProto proxy in Rust — Fake-TLS, built for hundreds of thousands of users per server.
 
 Status: early. The proxy accepts Fake-TLS (`ee`) secrets, relays to Telegram DCs
-in direct mode, forwards failed handshakes to a mask site and exports metrics.
-Connection limits, idle timeouts and the buffer pool are not implemented yet;
-`idle_timeout_secs` and `max_connections` are accepted but have no effect.
+in direct mode, forwards failed handshakes to a mask site, enforces connection
+and idle limits and exports metrics. The buffer pool and per-core listeners are
+not implemented yet: an idle session currently costs about 54 KB of resident
+memory (two 16 KiB relay buffers plus task and allocator overhead).
 
 ## Build
 
@@ -68,6 +69,8 @@ certificate and answers.
   name supplied by a client.
 - `mask_max_connections` caps concurrent masked connections. Beyond it, failed
   handshakes get no reply.
+- `mask_idle_timeout_secs` drops a masked connection when either direction is
+  silent that long; `mask_dns_ttl_secs` is how long a resolved mask host is reused.
 
 A handshake that fails after the proxy has already sent its ServerHello (a bad
 obfuscated2 init) cannot be masked and gets no further reply.
@@ -79,6 +82,8 @@ text at `/metrics`:
 
 | metric | labels | meaning |
 |---|---|---|
+| `echo_mtproxy_connections_open` | | client connections open, in any state |
+| `echo_mtproxy_connections_over_limit_total` | | connections refused because `max_connections` were open |
 | `echo_mtproxy_handshakes_total` | `sni`, `result` | handshakes by outcome: `accepted`, `malformed`, `bad_digest`, `bad_timestamp`, `replay`, `bad_init`, `timeout` |
 | `echo_mtproxy_sessions_active` | `sni` | relayed sessions currently open |
 | `echo_mtproxy_mask_connections_total` | `target`, `result` | masked connections: `forwarded`, `connect_failed`, `limited` |
@@ -87,6 +92,17 @@ text at `/metrics`:
 `sni` takes only names known at startup: the `mask_domains` entries, the default
 mask host and the secrets' domains. Every other SNI is counted as `_other`, so
 clients cannot create new series.
+
+## Limits
+
+- `max_connections` counts every open client connection. Connections beyond it
+  never get a reply: up to 1/16 of the limit (16 to 4096) are held silently
+  until the handshake timeout, the rest are closed immediately.
+- `idle_timeout_secs` closes a relayed session after that long without a byte
+  in either direction (checked four times per period, so up to 25% late).
+  `0` disables it.
+- `replay_cache_entries` sizes the replay cache. Its memory is fixed:
+  85.3 bytes per entry, 171 MB at the default of 2 000 000.
 
 ## Run
 
@@ -134,9 +150,30 @@ the allowed window, or the server being unable to reach Telegram.
 ## Tests
 
 ```sh
-cargo test                                   # unit, property, vector and integration tests
+cargo test                                   # unit, property, vector, integration and 10k-session soak tests
 cargo test --test integration -- --ignored   # also talk to real Telegram DCs
+cargo test --release --test rss -- --ignored --nocapture   # memory per idle session (Linux)
+cargo bench                                  # cipher, handshake and relay benchmarks
 ```
+
+The soak test opens 10 000 concurrent sessions and needs about 40 500 file
+descriptors; it raises its own soft limit and says so if the hard limit is too
+low. `SOAK_CONNECTIONS` changes the count.
+
+The memory test starts the real binary, opens 1 000 and then 50 000 idle
+sessions (`RSS_BASELINE_SESSIONS`, `RSS_SESSIONS`), and compares the proxy's
+VmRSS between the two, reporting kernel socket memory separately. It needs
+about 101 000 descriptors per process, so run it with `ulimit -n 200000`.
+
+Fuzzing needs a nightly toolchain and `cargo install cargo-fuzz`:
+
+```sh
+cd fuzz
+mkdir -p corpus/client_hello
+cargo +nightly fuzz run client_hello corpus/client_hello seeds/client_hello -- -max_total_time=600
+```
+
+The targets are `client_hello`, `record_reader` and `obfs2_init`.
 
 The ignored tests send the first message of an MTProto handshake through the
 proxy to each DC, once per upstream mode. Run them on the server to check that
