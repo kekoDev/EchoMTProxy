@@ -1476,3 +1476,96 @@ async fn binary_refuses_to_start_when_a_listen_address_is_taken() {
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains(&busy.to_string()), "{stderr}");
 }
+
+#[tokio::test]
+async fn traffic_metrics_follow_real_sessions() {
+    let dc = spawn_echo_dc(true).await;
+    // An 8 Mbit/s link with the threshold at half; media at 100 kB/s, no burst.
+    let (proxy, handle) = spawn_proxy_handle(&format!(
+        "secrets = [\"{SECRET_HEX}\"]\n\
+         link_capacity_bps = 8000000\n\
+         congestion_threshold = 0.5\n\
+         media_rate_bps = 800000\n\
+         media_burst_bytes = 0\n\
+         metrics_listen = \"\"\n\
+         [dc_override]\n\
+         {DC} = \"{dc}\"\n"
+    ))
+    .await;
+    let stats = handle.stats().clone();
+    tokio::spawn(server::run_congestion_control(stats.clone()));
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let metrics = listener.local_addr().unwrap();
+    tokio::spawn(stats::serve_metrics(listener, stats.clone()));
+
+    async fn scrape(addr: SocketAddr) -> String {
+        let mut http = TcpStream::connect(addr).await.unwrap();
+        http.write_all(b"GET /metrics HTTP/1.1\r\nHost: x\r\n\r\n")
+            .await
+            .unwrap();
+        let mut text = String::new();
+        http.read_to_string(&mut text).await.unwrap();
+        text
+    }
+    fn value(text: &str, series: &str) -> f64 {
+        text.lines()
+            .find_map(|l| l.strip_prefix(series)?.strip_prefix(' '))
+            .unwrap_or_else(|| panic!("no series {series}"))
+            .parse()
+            .unwrap()
+    }
+
+    // A media session that is being throttled, and chat traffic over the threshold.
+    let mut media = Client::connect(proxy, -DC).await;
+    let media_task = tokio::spawn(async move {
+        let data = random_bytes(60_000);
+        assert!(media.echo(&data).await == data);
+        media
+    });
+    let mut chat = Client::connect(proxy, DC).await;
+    let chunk = random_bytes(200_000);
+    let mut seen_throttled = 0.0f64;
+    let mut seen_egress = 0.0f64;
+    let mut lowest_scale = 1.0f64;
+    for _ in 0..6 {
+        assert!(chat.echo(&chunk).await == chunk);
+        let text = scrape(metrics).await;
+        seen_throttled =
+            seen_throttled.max(value(&text, "echo_mtproxy_media_connections_throttled"));
+        seen_egress = seen_egress.max(value(&text, "echo_mtproxy_egress_bits_per_second"));
+        lowest_scale = lowest_scale.min(value(&text, "echo_mtproxy_congestion_scale"));
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert_eq!(
+        seen_throttled, 1.0,
+        "the waiting media session was not reported"
+    );
+    assert!(seen_egress > 4_000_000.0, "egress {seen_egress}");
+    assert!((0.05..1.0).contains(&lowest_scale), "scale {lowest_scale}");
+
+    let _media = timeout(Duration::from_secs(30), media_task)
+        .await
+        .unwrap()
+        .unwrap();
+    let text = scrape(metrics).await;
+    assert!(value(&text, "echo_mtproxy_relay_bytes_total{lane=\"chat\"}") >= 2_400_000.0);
+    let media_bytes = value(&text, "echo_mtproxy_relay_bytes_total{lane=\"media\"}");
+    assert!(
+        (120_000.0..130_000.0).contains(&media_bytes),
+        "{media_bytes}"
+    );
+    // The media session still owes a wait for its last bytes; once that has
+    // passed nothing is throttled.
+    let mut throttled = 1.0;
+    for _ in 0..300 {
+        throttled = value(
+            &scrape(metrics).await,
+            "echo_mtproxy_media_connections_throttled",
+        );
+        if throttled == 0.0 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert_eq!(throttled, 0.0);
+}

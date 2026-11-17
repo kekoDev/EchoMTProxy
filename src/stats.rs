@@ -7,7 +7,7 @@ use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
-use crate::limit::Limits;
+use crate::limit::{Lane, Limits};
 
 /// Upper bounds, in seconds, of the clock-offset histogram buckets. Offsets
 /// above the last bound land in an implicit +Inf bucket.
@@ -340,6 +340,32 @@ impl Stats {
             self.connections_accepted(),
             self.connections_over_limit()
         )?;
+        let limits = &self.limits;
+        writeln!(
+            out,
+            "# HELP echo_mtproxy_relay_bytes_total Bytes relayed, both directions, by lane.\n\
+             # TYPE echo_mtproxy_relay_bytes_total counter\n\
+             echo_mtproxy_relay_bytes_total{{lane=\"media\"}} {}\n\
+             echo_mtproxy_relay_bytes_total{{lane=\"chat\"}} {}\n\
+             # HELP echo_mtproxy_egress_bits_per_second Relay egress over the last \
+             congestion-control tick.\n\
+             # TYPE echo_mtproxy_egress_bits_per_second gauge\n\
+             echo_mtproxy_egress_bits_per_second {}\n\
+             # HELP echo_mtproxy_congestion_scale Share of the configured media rate \
+             currently allowed (1 = no congestion).\n\
+             # TYPE echo_mtproxy_congestion_scale gauge\n\
+             echo_mtproxy_congestion_scale {:.4}\n\
+             # HELP echo_mtproxy_media_connections_throttled Media connections waiting on \
+             their rate limit right now.\n\
+             # TYPE echo_mtproxy_media_connections_throttled gauge\n\
+             echo_mtproxy_media_connections_throttled {}",
+            limits.bytes(Lane::Media),
+            limits.bytes(Lane::Chat),
+            limits.egress_bps(),
+            limits.scale(),
+            limits.throttled_now()
+        )?;
+
         let (retried, retry_failed) = self.upstream_retries();
         writeln!(
             out,
@@ -639,6 +665,34 @@ mod tests {
     }
 
     #[test]
+    fn traffic_and_congestion_metrics_are_rendered() {
+        let stats = Arc::new(Stats::with_limits(
+            ["a.example".to_owned()],
+            // 1 Mbit/s link with the threshold at 80%.
+            Limits::new(3_000_000, 0, 1_000_000, 0.8),
+        ));
+        let text = stats.render();
+        for line in [
+            "echo_mtproxy_relay_bytes_total{lane=\"media\"} 0",
+            "echo_mtproxy_relay_bytes_total{lane=\"chat\"} 0",
+            "echo_mtproxy_egress_bits_per_second 0",
+            "echo_mtproxy_congestion_scale 1.0000",
+            "echo_mtproxy_media_connections_throttled 0",
+            "echo_mtproxy_upstream_retries_total{result=\"reconnected\"} 0",
+            "echo_mtproxy_upstream_retries_total{result=\"failed\"} 0",
+        ] {
+            assert!(text.lines().any(|l| l == line), "missing: {line}\n{text}");
+        }
+
+        stats.record_upstream_retry(true);
+        stats.record_upstream_retry(true);
+        stats.record_upstream_retry(false);
+        let text = stats.render();
+        assert!(text.contains("echo_mtproxy_upstream_retries_total{result=\"reconnected\"} 2\n"));
+        assert!(text.contains("echo_mtproxy_upstream_retries_total{result=\"failed\"} 1\n"));
+    }
+
+    #[test]
     fn render_is_valid_prometheus_text() {
         let stats = stats();
         stats.record_handshake(0, HandshakeResult::Accepted);
@@ -672,9 +726,27 @@ mod tests {
             assert!(
                 line.starts_with("# ")
                     || (line.starts_with("echo_mtproxy_")
-                        && line.rsplit(' ').next().unwrap().parse::<u64>().is_ok()),
+                        && line.rsplit(' ').next().unwrap().parse::<f64>().is_ok()),
                 "{line}"
             );
+        }
+        // Every series has a TYPE line before its first sample.
+        let mut typed = std::collections::HashSet::new();
+        for line in text.lines() {
+            if let Some(rest) = line.strip_prefix("# TYPE ") {
+                typed.insert(rest.split(' ').next().unwrap().to_owned());
+            } else if !line.starts_with('#') {
+                let name = line.split(['{', ' ']).next().unwrap();
+                let family = name
+                    .strip_suffix("_bucket")
+                    .or_else(|| name.strip_suffix("_sum"))
+                    .or_else(|| name.strip_suffix("_count"))
+                    .unwrap_or(name);
+                assert!(
+                    typed.contains(family) || typed.contains(name),
+                    "no TYPE for {name}"
+                );
+            }
         }
         assert!(text.ends_with('\n'));
     }
