@@ -83,6 +83,7 @@ text at `/metrics`:
 | metric | labels | meaning |
 |---|---|---|
 | `echo_mtproxy_connections_open` | | client connections open, in any state |
+| `echo_mtproxy_connections_accepted_total` | | connections taken off the listeners, admitted or not |
 | `echo_mtproxy_connections_over_limit_total` | | connections refused because `max_connections` were open |
 | `echo_mtproxy_pool_buffers_in_use` | | relay buffers borrowed right now; idle sessions hold none |
 | `echo_mtproxy_handshakes_total` | `sni`, `result` | handshakes by outcome: `accepted`, `malformed`, `bad_digest`, `bad_timestamp`, `replay`, `bad_init`, `timeout` |
@@ -107,6 +108,10 @@ clients cannot create new series.
 
 - `pin_workers` pins each worker thread to one CPU. Off by default and
   unmeasured; try it together with per-CPU packet steering.
+- `reuse_port` opens one `SO_REUSEPORT` listener per worker. Off by default
+  and undecided: no benefit showed up on loopback.
+- Building with `--features mimalloc` uses mimalloc as the allocator. Off by
+  default and undecided for the same reason.
 
 ## Run
 
@@ -158,7 +163,12 @@ cargo test                                   # unit, property, vector, integrati
 cargo test --test integration -- --ignored   # also talk to real Telegram DCs
 cargo test --release --test rss -- --ignored --nocapture   # memory per idle session (Linux)
 cargo bench                                  # cipher, handshake and relay benchmarks
+cargo test --release --test storm -- --ignored --nocapture # accept and handshake rate under a connection storm (Linux)
 ```
+
+The storm test drives the real binary and prints accepted connections per
+second and full handshakes per second. Use it to compare builds and settings,
+for example `--features mimalloc` or `STORM_EXTRA_CONFIG='reuse_port = true'`.
 
 The soak test opens 10 000 concurrent sessions and needs about 40 500 file
 descriptors; it raises its own soft limit and says so if the hard limit is too
