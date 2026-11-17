@@ -30,8 +30,11 @@ pub enum HelloError {
     Malformed,
     #[error("digest matches no secret")]
     BadDigest,
-    #[error("timestamp outside the allowed window")]
-    BadTimestamp,
+    /// `skew_secs` is the client's timestamp minus the proxy's clock:
+    /// negative when the client clock is behind, positive when it is ahead.
+    #[error("timestamp outside the allowed window (client clock {} s {})",
+        .skew_secs.unsigned_abs(), skew_direction(*.skew_secs))]
+    BadTimestamp { skew_secs: i64 },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
@@ -40,6 +43,15 @@ pub enum RecordError {
     BadType,
     #[error("unexpected tls record version")]
     BadVersion,
+}
+
+/// "behind" or "ahead", for a client-minus-proxy clock difference.
+pub fn skew_direction(skew_secs: i64) -> &'static str {
+    if skew_secs < 0 {
+        "behind"
+    } else {
+        "ahead"
+    }
 }
 
 fn hmac_sha256(key: &[u8], parts: &[&[u8]]) -> [u8; 32] {
@@ -215,7 +227,10 @@ pub fn verify_client_hello<'a>(
         }
         let timestamp = u32::from_le_bytes(ts);
         if !skew.allows(now_unix, timestamp) {
-            error = HelloError::BadTimestamp;
+            let now = i64::try_from(now_unix).unwrap_or(i64::MAX);
+            error = HelloError::BadTimestamp {
+                skew_secs: i64::from(timestamp).saturating_sub(now),
+            };
             continue;
         }
         return Ok(ClientHello {
@@ -515,6 +530,10 @@ mod tests {
         accept_uptime: true,
     };
 
+    fn rejected(skew_secs: i64) -> HelloError {
+        HelloError::BadTimestamp { skew_secs }
+    }
+
     fn rng() -> StdRng {
         StdRng::seed_from_u64(7)
     }
@@ -601,11 +620,11 @@ mod tests {
         };
         // Client behind the proxy: allowed up to (not including) 600 s.
         assert!(check(NOW - 599).is_ok());
-        assert_eq!(check(NOW - 600), Err(HelloError::BadTimestamp));
+        assert_eq!(check(NOW - 600), Err(rejected(-600)));
         // Client ahead of the proxy: allowed up to (not including) 1200 s.
         assert!(check(NOW + 1199).is_ok());
-        assert_eq!(check(NOW + 1200), Err(HelloError::BadTimestamp));
-        assert_eq!(check(NOW - 86_400), Err(HelloError::BadTimestamp));
+        assert_eq!(check(NOW + 1200), Err(rejected(1200)));
+        assert_eq!(check(NOW - 86_400), Err(rejected(-86_400)));
     }
 
     #[test]
@@ -616,7 +635,7 @@ mod tests {
         let behind = signed_hello(&secrets[0], (NOW - 900) as u32);
         assert_eq!(
             verify_client_hello(&behind, &secrets, NOW, &SKEW),
-            Err(HelloError::BadTimestamp)
+            Err(rejected(-900))
         );
         let ahead = signed_hello(&secrets[0], (NOW + 900) as u32);
         assert!(verify_client_hello(&ahead, &secrets, NOW, &SKEW).is_ok());
@@ -634,14 +653,41 @@ mod tests {
             assert!(verify_client_hello(&record, &secrets, NOW, &SKEW).is_ok());
             assert_eq!(
                 verify_client_hello(&record, &secrets, NOW, &strict),
-                Err(HelloError::BadTimestamp)
+                Err(rejected(i64::from(timestamp) - NOW as i64))
             );
         }
         let record = signed_hello(&secrets[0], UPTIME_TIMESTAMP_LIMIT);
         assert_eq!(
             verify_client_hello(&record, &secrets, NOW, &SKEW),
-            Err(HelloError::BadTimestamp)
+            Err(rejected(i64::from(UPTIME_TIMESTAMP_LIMIT) - NOW as i64))
         );
+    }
+
+    #[test]
+    fn rejection_reports_the_offset_and_direction() {
+        assert_eq!(
+            rejected(-900).to_string(),
+            "timestamp outside the allowed window (client clock 900 s behind)"
+        );
+        assert_eq!(
+            rejected(1300).to_string(),
+            "timestamp outside the allowed window (client clock 1300 s ahead)"
+        );
+        assert_eq!(skew_direction(i64::MIN), "behind");
+        assert!(rejected(i64::MIN).to_string().contains("behind"));
+
+        // A proxy clock beyond i64 range must not overflow the subtraction.
+        let secrets = [secret(1)];
+        let record = signed_hello(&secrets[0], u32::MAX);
+        let strict = SkewPolicy {
+            behind_secs: 1,
+            ahead_secs: 1,
+            accept_uptime: false,
+        };
+        assert!(matches!(
+            verify_client_hello(&record, &secrets, u64::MAX, &strict),
+            Err(HelloError::BadTimestamp { skew_secs }) if skew_secs < 0
+        ));
     }
 
     #[test]

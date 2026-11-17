@@ -13,6 +13,7 @@ use crate::dc::DcTable;
 use crate::obfs2::{self, ClientInit, InitError, INIT_LEN, TAG_SECURE};
 use crate::relay::{relay, Ciphers};
 use crate::replay::ReplayCache;
+use crate::stats::Stats;
 use crate::tls::{
     self, HelloError, RecordError, RecordReader, SkewPolicy, MAX_RECORD_PAYLOAD,
     MIN_CLIENT_HELLO_PAYLOAD, RECORD_HEADER_LEN,
@@ -30,9 +31,14 @@ pub struct Proxy {
     dc: DcTable,
     upstream_mode: UpstreamMode,
     handshake_timeout: Duration,
+    stats: Stats,
 }
 
 impl Proxy {
+    pub fn stats(&self) -> &Stats {
+        &self.stats
+    }
+
     pub fn from_config(config: &Config) -> anyhow::Result<Self> {
         let skew = SkewPolicy {
             behind_secs: config.time_skew_behind_secs,
@@ -53,6 +59,7 @@ impl Proxy {
             dc,
             upstream_mode: config.upstream_mode,
             handshake_timeout: Duration::from_secs(config.handshake_timeout_secs),
+            stats: Stats::default(),
         })
     }
 }
@@ -229,7 +236,16 @@ pub async fn handle_client(mut stream: TcpStream, proxy: Arc<Proxy>) {
             return;
         }
         Ok(Err(reason)) => {
-            tracing::debug!(%reason, "handshake rejected");
+            if let Reject::Hello(HelloError::BadTimestamp { skew_secs }) = reason {
+                proxy.stats.record_skew_rejection(skew_secs);
+                tracing::debug!(
+                    direction = tls::skew_direction(skew_secs),
+                    offset_secs = skew_secs.unsigned_abs(),
+                    "handshake rejected: client clock outside the skew window"
+                );
+            } else {
+                tracing::debug!(%reason, "handshake rejected");
+            }
             let _ = tokio::time::timeout_at(deadline, drain(&mut stream)).await;
             return;
         }

@@ -101,12 +101,17 @@ async fn spawn_proxy_with(upstream_mode: &str, dc_addr: SocketAddr, extra: &str)
 }
 
 async fn spawn_proxy_from(config: &str) -> SocketAddr {
+    spawn_proxy_handle(config).await.0
+}
+
+/// Like `spawn_proxy_from`, but also returns the proxy for inspecting its stats.
+async fn spawn_proxy_handle(config: &str) -> (SocketAddr, Arc<Proxy>) {
     let config = Config::parse(config).unwrap();
     let proxy = Arc::new(Proxy::from_config(&config).unwrap());
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
-    tokio::spawn(server::serve(listener, proxy));
-    addr
+    tokio::spawn(server::serve(listener, proxy.clone()));
+    (addr, proxy)
 }
 
 fn signed_hello(key: &[u8], timestamp: u32) -> Vec<u8> {
@@ -402,6 +407,44 @@ async fn clock_skew_outside_the_window_gets_no_response() {
         let record = timeout(STEP, read_record(&mut stream)).await.unwrap();
         assert_eq!(record[0], 0x16, "offset {offset}");
     }
+}
+
+#[tokio::test]
+async fn skew_rejections_are_counted_with_their_offset() {
+    let (proxy, handle) = spawn_proxy_handle(&format!("secrets = [\"{SECRET_HEX}\"]\n")).await;
+    let key = secret().key;
+
+    // 700 s and 900 s behind, 1300 s ahead: all outside the default window.
+    for offset in [-700i64, -900, 1300] {
+        let mut stream = TcpStream::connect(proxy).await.unwrap();
+        let timestamp = (i64::from(unix_now()) + offset) as u32;
+        stream
+            .write_all(&signed_hello(&key, timestamp))
+            .await
+            .unwrap();
+        assert!(stays_silent(&mut stream).await, "offset {offset}");
+    }
+    // Accepted handshakes and non-skew rejections must not be counted.
+    let mut ok = TcpStream::connect(proxy).await.unwrap();
+    ok.write_all(&signed_hello(&key, unix_now())).await.unwrap();
+    assert_eq!(timeout(STEP, read_record(&mut ok)).await.unwrap()[0], 0x16);
+    let mut wrong = TcpStream::connect(proxy).await.unwrap();
+    wrong
+        .write_all(&signed_hello(&[0x42; 16], unix_now() - 5000))
+        .await
+        .unwrap();
+    assert!(stays_silent(&mut wrong).await);
+
+    let behind = handle.stats().skew_rejected_behind.snapshot();
+    let ahead = handle.stats().skew_rejected_ahead.snapshot();
+    assert_eq!(behind.count, 2);
+    assert_eq!(ahead.count, 1);
+    // The test's clock and the proxy's are read a moment apart.
+    assert!((1598..=1604).contains(&behind.sum_secs), "{behind:?}");
+    assert!((1296..=1300).contains(&ahead.sum_secs), "{ahead:?}");
+    // Buckets: <=60, <=300, <=900, <=1800, ...
+    assert_eq!(behind.buckets[2] + behind.buckets[3], 2);
+    assert_eq!(ahead.buckets[3], 1);
 }
 
 #[tokio::test]
