@@ -33,5 +33,12 @@ test = false
 doc = false
 bench = false
 
+[[bin]]
+name = "middle_codec"
+path = "fuzz_targets/middle_codec.rs"
+test = false
+doc = false
+bench = false
+
 # Keeps this crate out of any parent workspace; it needs a nightly toolchain.
 [workspace]

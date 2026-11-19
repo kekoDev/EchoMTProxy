@@ -168,6 +168,9 @@ fn main() -> anyhow::Result<()> {
             tokio::spawn(server::serve(listener, proxy.clone()));
         }
         tokio::spawn(server::run_congestion_control(proxy.stats().clone()));
+        if let Some(middle) = proxy.middle() {
+            tokio::spawn(echo_mtproxy::middle::run_reload(middle.clone()));
+        }
         if let Some(addr) = config.metrics_addr() {
             let listener = tokio::net::TcpListener::bind(addr)
                 .await

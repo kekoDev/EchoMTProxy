@@ -15,9 +15,10 @@ use crate::config::{Config, Secret, UpstreamMode};
 use crate::dc::DcTable;
 use crate::limit::{Direction, Lane, Limits, SessionTraffic};
 use crate::mask::Masker;
+use crate::middle::{self, DownDecoder, Middle, UpEncoder, DOWN_SLACK};
 use crate::obfs2::{self, ClientInit, InitError, INIT_LEN, TAG_SECURE};
 use crate::pool;
-use crate::relay::{relay, Ciphers, ClosedBy, Ended};
+use crate::relay::{relay, relay_middle, Ciphers, ClosedBy, Ended, MiddleCodec};
 use crate::replay::ReplayCache;
 use crate::stats::{HandshakeResult, MaskResult, Stats};
 use crate::tls::{
@@ -41,6 +42,8 @@ pub struct Proxy {
     replay: ReplayCache,
     dc: DcTable,
     upstream_mode: UpstreamMode,
+    /// Set when `upstream_mode` is `middle`.
+    middle: Option<Arc<Middle>>,
     handshake_timeout: Duration,
     /// `None` when `idle_timeout_secs` is 0.
     idle_timeout: Option<Duration>,
@@ -53,6 +56,11 @@ pub struct Proxy {
 impl Proxy {
     pub fn stats(&self) -> &Arc<Stats> {
         &self.stats
+    }
+
+    /// The middle-proxy table, when that mode is on.
+    pub fn middle(&self) -> Option<&Arc<Middle>> {
+        self.middle.as_ref()
     }
 
     pub fn from_config(config: &Config) -> anyhow::Result<Self> {
@@ -90,8 +98,22 @@ impl Proxy {
                 .chain(secrets.iter().map(|s| s.domain.clone())),
             limits,
         );
+        let middle = if config.upstream_mode == UpstreamMode::Middle {
+            let (public_v4, public_v6) = config.parsed_public_ips()?;
+            Some(Arc::new(Middle::new(
+                config.middle_proxy_config_files.clone(),
+                (!config.middle_proxy_secret_file.is_empty())
+                    .then(|| config.middle_proxy_secret_file.clone().into()),
+                config.parsed_ad_tag()?,
+                public_v4,
+                public_v6,
+            )?))
+        } else {
+            None
+        };
         Ok(Self {
             secrets,
+            middle,
             replay: ReplayCache::new(
                 Duration::from_secs(skew.window_secs()),
                 config.replay_cache_entries,
@@ -215,9 +237,21 @@ impl Early {
     }
 }
 
+/// A session ready to relay through a middle proxy.
+struct ViaMiddle {
+    upstream: TcpStream,
+    records: RecordReader,
+    codec: MiddleCodec,
+    label: usize,
+    lane: Lane,
+    /// Client payload already sent upstream with the first request.
+    sent_len: usize,
+}
+
 /// What to do with a connection once everything before the relay is settled.
 enum Next {
     Relay(Established),
+    Middle(Box<ViaMiddle>),
     /// Hand the connection, with these already-read bytes, to a mask site.
     Mask(Vec<u8>),
     /// Stay silent until the client gives up or the handshake deadline passes.
@@ -330,7 +364,105 @@ fn upstream_handshake(
             )
         }
         UpstreamMode::Plain => (TAG_SECURE.to_vec(), None, None),
+        // Middle-proxy sessions never take this path.
+        UpstreamMode::Middle => (Vec::new(), None, None),
     }
+}
+
+/// Connection attempts to middle proxies for one session before giving up.
+const MIDDLE_ATTEMPTS: usize = 3;
+const MIDDLE_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Connects to a middle proxy for the client's DC, handshakes, and sends any
+/// client payload that arrived behind the init.
+async fn connect_middle(
+    session: Session,
+    proxy: &Proxy,
+    middle: &Middle,
+    client_addr: SocketAddr,
+) -> io::Result<(TcpStream, RecordReader, MiddleCodec, usize)> {
+    let Session {
+        init,
+        records,
+        mut leftover,
+    } = session;
+    let table = middle.table();
+    let mut connected = None;
+    let mut last_error = io::Error::new(
+        io::ErrorKind::InvalidInput,
+        "no middle proxy for this datacenter index",
+    );
+    // A lone address is tried again: a refused handshake is often transient.
+    let candidates = table.candidates(init.dc_idx, proxy.dc.prefer_v6());
+    for addr in candidates
+        .iter()
+        .copied()
+        .cycle()
+        .take(if candidates.is_empty() {
+            0
+        } else {
+            MIDDLE_ATTEMPTS
+        })
+    {
+        let attempt = async {
+            let mut stream = proxy.dc.connect_one(addr).await?;
+            let hello = tokio::time::timeout(
+                MIDDLE_HANDSHAKE_TIMEOUT,
+                middle::handshake(&mut stream, table.secret(), middle.public_ip(addr)),
+            )
+            .await
+            .map_err(|_| {
+                io::Error::new(io::ErrorKind::TimedOut, "middle-proxy handshake timed out")
+            })??;
+            io::Result::Ok((stream, hello))
+        };
+        match attempt.await {
+            Ok(pair) => {
+                proxy.stats.record_middle_connect(true);
+                connected = Some(pair);
+                break;
+            }
+            Err(err) => {
+                proxy.stats.record_middle_connect(false);
+                tracing::debug!(dc = init.dc_idx, error = %err, "middle proxy unusable");
+                last_error = err;
+            }
+        }
+    }
+    let Some((upstream, hello)) = connected else {
+        return Err(last_error);
+    };
+
+    let mut up = Box::new(UpEncoder::new(
+        hello.enc,
+        client_addr,
+        hello.our_addr,
+        middle.ad_tag.as_ref(),
+    ));
+    let mut down = Box::new(DownDecoder::new(hello.dec));
+    // Normally only block padding follows the handshake answer.
+    let mut pending = [0u8; DOWN_SLACK + 64];
+    let len = hello.pending.len().min(64);
+    pending[DOWN_SLACK..DOWN_SLACK + len].copy_from_slice(&hello.pending[..len]);
+    down.parse(&mut pending, DOWN_SLACK, DOWN_SLACK + len)?;
+
+    let mut client_dec = Box::new(init.dec);
+    client_dec.apply(&mut leftover);
+    crate::relay::send_to_middle(&upstream, &mut up, &leftover)
+        .await
+        .map_err(|(_, err)| err)?;
+
+    Ok((
+        upstream,
+        records,
+        MiddleCodec {
+            client_dec,
+            client_enc: Box::new(init.enc),
+            up,
+            down,
+        },
+        leftover.len(),
+    ))
 }
 
 /// Connects to the DC and sends the upstream handshake together with any
@@ -550,7 +682,12 @@ async fn await_first_response(
 }
 
 /// Everything up to the relay: handshake, accounting and the upstream connect.
-async fn negotiate(stream: &mut TcpStream, proxy: &Proxy, deadline: Instant) -> Next {
+async fn negotiate(
+    stream: &mut TcpStream,
+    proxy: &Proxy,
+    deadline: Instant,
+    client_addr: Option<SocketAddr>,
+) -> Next {
     let stats = &proxy.stats;
     let mut seen = Seen::default();
 
@@ -561,6 +698,22 @@ async fn negotiate(stream: &mut TcpStream, proxy: &Proxy, deadline: Instant) -> 
             stats.record_handshake(label, HandshakeResult::Accepted);
             drop(seen);
             let dc_idx = session.init.dc_idx;
+            if let (Some(middle), Some(client_addr)) = (&proxy.middle, client_addr) {
+                return match connect_middle(session, proxy, middle, client_addr).await {
+                    Ok((upstream, records, codec, sent_len)) => Next::Middle(Box::new(ViaMiddle {
+                        upstream,
+                        records,
+                        codec,
+                        label,
+                        lane: Lane::from_dc_idx(dc_idx),
+                        sent_len,
+                    })),
+                    Err(err) => {
+                        tracing::debug!(dc = dc_idx, error = %err, "middle proxy connect failed");
+                        Next::Close
+                    }
+                };
+            }
             return match connect_upstream(session, proxy).await {
                 Ok((upstream, records, ciphers, early)) => Next::Relay(Established {
                     upstream,
@@ -607,6 +760,19 @@ async fn negotiate(stream: &mut TcpStream, proxy: &Proxy, deadline: Instant) -> 
     }
 }
 
+/// No addresses: only who closed, how much moved and for how long.
+fn log_session_end(ended: &Ended, traffic: &SessionTraffic<'_>) {
+    tracing::debug!(
+        closed_by = ended.by.as_str(),
+        lane = traffic.lane.as_str(),
+        bytes_up = traffic.bytes_up.load(Ordering::Relaxed),
+        bytes_down = traffic.bytes_down.load(Ordering::Relaxed),
+        duration_ms = traffic.duration().as_millis() as u64,
+        error = ended.error.as_ref().map(tracing::field::display),
+        "session ended"
+    );
+}
+
 /// Runs one client connection.
 ///
 /// The future of this function is the task that lives as long as the session,
@@ -618,8 +784,36 @@ pub async fn handle_client(mut stream: TcpStream, proxy: Arc<Proxy>) {
     let _ = stream.set_nodelay(true);
     let deadline = Instant::now() + proxy.handshake_timeout;
 
-    let next = Box::pin(negotiate(&mut stream, &proxy, deadline)).await;
+    // The middle proxy is told the client's address; that is part of its
+    // protocol and what Telegram counts sponsored-channel views by.
+    let client_addr = stream.peer_addr().ok();
+    let next = Box::pin(negotiate(&mut stream, &proxy, deadline, client_addr)).await;
     match next {
+        Next::Middle(session) => {
+            let ViaMiddle {
+                upstream,
+                records,
+                codec,
+                label,
+                lane,
+                sent_len,
+            } = *session;
+            let _active = proxy.stats.session_started(label);
+            let traffic = SessionTraffic::new(lane, &proxy.stats.limits, &stream);
+            let _ = traffic.account(Direction::Up, sent_len);
+            // Boxed so that sessions in the direct modes, whose relay is
+            // awaited inline, do not carry room for this one.
+            let ended = Box::pin(relay_middle(
+                &stream,
+                &upstream,
+                records,
+                codec,
+                proxy.idle_timeout,
+                &traffic,
+            ))
+            .await;
+            log_session_end(&ended, &traffic);
+        }
         Next::Relay(mut session) => {
             let _active = proxy.stats.session_started(session.label);
             let traffic = SessionTraffic::new(session.lane, &proxy.stats.limits, &stream);
@@ -656,16 +850,7 @@ pub async fn handle_client(mut stream: TcpStream, proxy: Arc<Proxy>) {
                 }
                 Err(ended) => ended,
             };
-            // No addresses: only who closed, how much moved and for how long.
-            tracing::debug!(
-                closed_by = ended.by.as_str(),
-                lane = traffic.lane.as_str(),
-                bytes_up = traffic.bytes_up.load(Ordering::Relaxed),
-                bytes_down = traffic.bytes_down.load(Ordering::Relaxed),
-                duration_ms = traffic.duration().as_millis() as u64,
-                error = ended.error.as_ref().map(tracing::field::display),
-                "session ended"
-            );
+            log_session_end(&ended, &traffic);
         }
         Next::Mask(bytes) => {
             let (target, result) = Box::pin(proxy.masker.forward(&stream, bytes)).await;

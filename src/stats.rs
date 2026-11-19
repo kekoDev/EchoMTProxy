@@ -140,6 +140,8 @@ pub struct Stats {
     connections_accepted: AtomicU64,
     upstream_retries_ok: AtomicU64,
     upstream_retries_failed: AtomicU64,
+    middle_connects_ok: AtomicU64,
+    middle_connects_failed: AtomicU64,
     /// Lane byte counters, media limits and the congestion scale.
     pub limits: Limits,
 }
@@ -201,6 +203,8 @@ impl Stats {
             connections_accepted: AtomicU64::new(0),
             upstream_retries_ok: AtomicU64::new(0),
             upstream_retries_failed: AtomicU64::new(0),
+            middle_connects_ok: AtomicU64::new(0),
+            middle_connects_failed: AtomicU64::new(0),
             limits,
         }
     }
@@ -237,6 +241,24 @@ impl Stats {
             &self.upstream_retries_failed
         };
         counter.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Counts one attempt to connect and handshake with a middle proxy.
+    pub fn record_middle_connect(&self, connected: bool) {
+        let counter = if connected {
+            &self.middle_connects_ok
+        } else {
+            &self.middle_connects_failed
+        };
+        counter.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// (connected, failed)
+    pub fn middle_connects(&self) -> (u64, u64) {
+        (
+            self.middle_connects_ok.load(Ordering::Relaxed),
+            self.middle_connects_failed.load(Ordering::Relaxed),
+        )
     }
 
     /// (reconnected, failed to reconnect)
@@ -376,6 +398,16 @@ impl Stats {
              # TYPE echo_mtproxy_upstream_retries_total counter\n\
              echo_mtproxy_upstream_retries_total{{result=\"reconnected\"}} {retried}\n\
              echo_mtproxy_upstream_retries_total{{result=\"failed\"}} {retry_failed}"
+        )?;
+
+        let (middle_ok, middle_failed) = self.middle_connects();
+        writeln!(
+            out,
+            "# HELP echo_mtproxy_middle_connects_total Connection attempts to Telegram \
+             middle proxies, including their handshake (upstream_mode = middle).\n\
+             # TYPE echo_mtproxy_middle_connects_total counter\n\
+             echo_mtproxy_middle_connects_total{{result=\"connected\"}} {middle_ok}\n\
+             echo_mtproxy_middle_connects_total{{result=\"failed\"}} {middle_failed}"
         )?;
 
         out.push_str(

@@ -51,6 +51,55 @@ Copy `config.example.toml` to `config.toml` and put the generated secret into
 | `fast`       | 2                     | 0                     | default                       |
 | `obfuscated` | 2                     | 2                     |                               |
 | `plain`      | 1                     | 1                     | experimental                  |
+| `middle`     | 2                     | 2                     | through Telegram's middle proxies; needed for an ad tag |
+
+## Middle-proxy mode and ad tag
+
+With `upstream_mode = "middle"` the proxy connects to Telegram's middle proxies
+instead of the DCs. This is the only mode in which Telegram shows a sponsored
+channel to the proxy's users:
+
+1. Register the proxy with [@MTProxybot](https://t.me/MTProxybot) and take the
+   tag it gives you.
+2. Set `upstream_mode = "middle"` and `ad_tag = "<32 hex characters>"`.
+
+What changes compared with the direct modes:
+
+- **Telegram learns each client's address.** Every request to a middle proxy
+  carries the client's IP and port; that is how the protocol works and how
+  sponsored-channel views are counted. The direct modes do not send it.
+- **It costs more CPU and memory.** Each message is re-framed, checksummed
+  (CRC32) and sent through AES-256-CBC on top of the client's AES-CTR, in both
+  directions, and a session keeps four cipher states instead of two. Measure
+  with `cargo bench --bench middle` and the `rss` test on your server before
+  moving a busy proxy to this mode.
+- **The middle-proxy list changes.** A list and the shared secret are built in,
+  but Telegram updates them. Refresh them from cron and point the config at the
+  files; the proxy re-reads a file within a minute of it changing, without a
+  restart, and keeps the old list if a new file is unusable:
+
+  ```sh
+  curl -fsS https://core.telegram.org/getProxyConfig   -o /etc/echo-mtproxy/proxy-multi.conf.new && mv /etc/echo-mtproxy/proxy-multi.conf.new /etc/echo-mtproxy/proxy-multi.conf
+  curl -fsS https://core.telegram.org/getProxyConfigV6 -o /etc/echo-mtproxy/proxy-multi-v6.conf.new && mv /etc/echo-mtproxy/proxy-multi-v6.conf.new /etc/echo-mtproxy/proxy-multi-v6.conf
+  curl -fsS https://core.telegram.org/getProxySecret   -o /etc/echo-mtproxy/proxy-secret.new && mv /etc/echo-mtproxy/proxy-secret.new /etc/echo-mtproxy/proxy-secret
+  ```
+
+  ```toml
+  middle_proxy_config_files = ["/etc/echo-mtproxy/proxy-multi.conf", "/etc/echo-mtproxy/proxy-multi-v6.conf"]
+  middle_proxy_secret_file = "/etc/echo-mtproxy/proxy-secret"
+  ```
+- **The server's public address matters.** The keys of a middle-proxy
+  connection are derived from the proxy's address and port as Telegram sees
+  them. If the address on the interface is not the public one (NAT), set
+  `public_ipv4` / `public_ipv6`. A NAT that also rewrites source ports cannot
+  be used. A wrong address shows up as
+  `echo_mtproxy_middle_connects_total{result="failed"}` growing and, at debug
+  level, `middle proxy did not accept the handshake`.
+
+Media limiting, congestion control, `upstream_bind_addrs`, masking and the
+metrics work the same in this mode. A session tries up to three middle-proxy
+connections before giving up; the retry on the other address family described
+below applies to the direct modes only.
 
 ## Masking
 
@@ -92,6 +141,7 @@ text at `/metrics`:
 | `echo_mtproxy_congestion_scale` | | share of the media rate currently allowed (1 = no congestion) |
 | `echo_mtproxy_media_connections_throttled` | | media connections waiting on their rate limit right now |
 | `echo_mtproxy_upstream_retries_total` | `result` | DC connections reset before answering and retried: `reconnected`, `failed` |
+| `echo_mtproxy_middle_connects_total` | `result` | connection attempts to middle proxies, handshake included: `connected`, `failed` |
 | `echo_mtproxy_handshakes_total` | `sni`, `result` | handshakes by outcome: `accepted`, `malformed`, `bad_digest`, `bad_timestamp`, `replay`, `bad_init`, `timeout` |
 | `echo_mtproxy_sessions_active` | `sni` | relayed sessions currently open |
 | `echo_mtproxy_mask_connections_total` | `target`, `result` | masked connections: `forwarded`, `connect_failed`, `limited` |
@@ -243,15 +293,23 @@ mkdir -p corpus/client_hello
 cargo +nightly fuzz run client_hello corpus/client_hello seeds/client_hello -- -max_total_time=600
 ```
 
-The targets are `client_hello`, `record_reader` and `obfs2_init`.
+The targets are `client_hello`, `record_reader`, `obfs2_init` and
+`middle_codec`.
 
 The ignored tests send the first message of an MTProto handshake through the
 proxy to each DC, once per upstream mode. Run them on the server to check that
-Telegram is reachable from there.
+Telegram is reachable from there. The middle-proxy ones need the server's
+public address:
+
+```sh
+cargo test --test integration real_dc -- --ignored
+ECHO_PUBLIC_IPV4=<this server's public IPv4> cargo test --test middle real_middle -- --ignored --nocapture
+```
 
 `tests/vectors/mtprotoproxy.json` holds known-answer vectors produced by
 [alexbers/mtprotoproxy](https://github.com/alexbers/mtprotoproxy);
-`tests/vectors/gen_vectors.py` regenerates them.
+`tests/vectors/gen_vectors.py` regenerates them. `tests/vectors/middle.json`
+and `gen_middle_vectors.py` are the same for middle-proxy keys and frames.
 
 ## Load testing
 
