@@ -190,7 +190,13 @@ impl DcTable {
         Ok(socket)
     }
 
-    async fn connect_one(&self, addr: SocketAddr) -> io::Result<TcpStream> {
+    /// Whether IPv6 upstream addresses are tried first.
+    pub fn prefer_v6(&self) -> bool {
+        self.prefer_v6
+    }
+
+    /// Connects to one upstream address, from the next source address.
+    pub async fn connect_one(&self, addr: SocketAddr) -> io::Result<TcpStream> {
         let socket = self.prepare_socket(addr)?;
         let stream = tokio::time::timeout(CONNECT_TIMEOUT, socket.connect(addr))
             .await

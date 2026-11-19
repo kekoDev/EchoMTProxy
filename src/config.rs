@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 use std::fmt;
-use std::net::SocketAddr;
-use std::path::Path;
+use std::net::{IpAddr, SocketAddr};
+use std::path::{Path, PathBuf};
 
 use anyhow::Context;
 use rand::RngCore;
@@ -200,6 +200,8 @@ pub enum UpstreamMode {
     Fast,
     Obfuscated,
     Plain,
+    /// Through Telegram's middle proxies; required for an ad tag.
+    Middle,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
@@ -250,6 +252,18 @@ pub struct Config {
     pub max_connections: usize,
     pub metrics_listen: String,
     pub cipher_backend: CipherBackend,
+    /// Sponsored-channel tag from @MTProxybot, 32 hex characters. Needs
+    /// `upstream_mode = "middle"`.
+    pub ad_tag: String,
+    /// Files in the format of core.telegram.org/getProxyConfig (and
+    /// getProxyConfigV6). Empty uses the built-in list.
+    pub middle_proxy_config_files: Vec<PathBuf>,
+    /// File with core.telegram.org/getProxySecret. Empty uses the built-in one.
+    pub middle_proxy_secret_file: String,
+    /// This server's address as Telegram sees it, when it differs from the
+    /// address on its interface (NAT). Middle-proxy keys depend on it.
+    pub public_ipv4: String,
+    pub public_ipv6: String,
     /// DC id ("1".."5") to upstream address.
     pub dc_override: BTreeMap<String, SocketAddr>,
     /// DC id to an address for its IPv6 side only.
@@ -289,6 +303,11 @@ impl Default for Config {
             max_connections: 2_000_000,
             metrics_listen: "127.0.0.1:9100".to_owned(),
             cipher_backend: CipherBackend::Rustcrypto,
+            ad_tag: String::new(),
+            middle_proxy_config_files: Vec::new(),
+            middle_proxy_secret_file: String::new(),
+            public_ipv4: String::new(),
+            public_ipv6: String::new(),
             dc_override: BTreeMap::new(),
             dc_override_v6: BTreeMap::new(),
         }
@@ -329,6 +348,12 @@ impl Config {
         config.parsed_dc_overrides_v6()?;
         config.parsed_mask_domains()?;
         config.default_mask(&secrets)?;
+        let ad_tag = config.parsed_ad_tag()?;
+        anyhow::ensure!(
+            ad_tag.is_none() || config.upstream_mode == UpstreamMode::Middle,
+            "`ad_tag` needs upstream_mode = \"middle\""
+        );
+        config.parsed_public_ips()?;
         if !config.metrics_listen.is_empty() {
             config
                 .metrics_listen
@@ -409,6 +434,37 @@ impl Config {
 
     pub fn metrics_addr(&self) -> Option<SocketAddr> {
         self.metrics_listen.parse().ok()
+    }
+
+    /// The ad tag, if one is set.
+    pub fn parsed_ad_tag(&self) -> anyhow::Result<Option<[u8; 16]>> {
+        if self.ad_tag.is_empty() {
+            return Ok(None);
+        }
+        let bytes = hex::decode(&self.ad_tag).ok();
+        match bytes.and_then(|b| <[u8; 16]>::try_from(b).ok()) {
+            Some(tag) => Ok(Some(tag)),
+            None => anyhow::bail!("`ad_tag` must be 32 hex characters"),
+        }
+    }
+
+    /// (`public_ipv4`, `public_ipv6`), each `None` when empty.
+    pub fn parsed_public_ips(&self) -> anyhow::Result<(Option<IpAddr>, Option<IpAddr>)> {
+        let v4 = match self.public_ipv4.as_str() {
+            "" => None,
+            text => Some(IpAddr::V4(
+                text.parse()
+                    .context("`public_ipv4` must be an IPv4 address")?,
+            )),
+        };
+        let v6 = match self.public_ipv6.as_str() {
+            "" => None,
+            text => Some(IpAddr::V6(
+                text.parse()
+                    .context("`public_ipv6` must be an IPv6 address")?,
+            )),
+        };
+        Ok((v4, v6))
     }
 
     /// Overrides as (zero-based DC index, address).

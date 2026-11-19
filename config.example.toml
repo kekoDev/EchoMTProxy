@@ -65,7 +65,25 @@ congestion_threshold = 0.85
 #   fast        2 / 0   obfuscated upstream reusing the client's key for the DC->client leg
 #   obfuscated  2 / 2   obfuscated upstream with independent keys
 #   plain       1 / 1   experimental: unobfuscated upstream, not yet verified against real DCs
+#   middle      2 / 2   through Telegram's middle proxies (AES-CTR + AES-CBC + CRC32 each way)
 upstream_mode = "fast"
+
+# Sponsored channel. Register the proxy with @MTProxybot, put the tag it gives
+# you here and set upstream_mode = "middle"; the tag works in no other mode.
+# In middle mode Telegram is told each client's IP address and port.
+ad_tag = ""                      # 32 hex characters
+# Middle-proxy list and secret. Empty = the ones built into the binary.
+# Telegram changes them, so refresh these files from cron (see README); a
+# changed file is picked up within a minute without a restart.
+#   https://core.telegram.org/getProxyConfig  and  .../getProxyConfigV6
+#   https://core.telegram.org/getProxySecret
+middle_proxy_config_files = []
+middle_proxy_secret_file = ""
+# This server's address as Telegram sees it, if the address on the interface
+# is a different one (NAT). Middle-proxy keys depend on it. Empty = the
+# address of the outgoing connection.
+public_ipv4 = ""
+public_ipv6 = ""
 
 # Accepted client clock error. A ClientHello is valid for behind + ahead seconds.
 time_skew_behind_secs = 600      # client clock may lag the proxy by this much

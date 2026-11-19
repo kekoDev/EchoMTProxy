@@ -6,6 +6,7 @@ use tokio::net::TcpStream;
 
 use crate::cipher::{AesCtr, Ctr};
 use crate::limit::{Direction, SessionTraffic};
+use crate::middle::{DownDecoder, UpEncoder};
 use crate::pool;
 use crate::tls::{record_header, RecordReader, MAX_RECORD_PAYLOAD, RECORD_HEADER_LEN};
 
@@ -159,6 +160,167 @@ async fn upstream_to_client(
         if let Some(wait) = wait {
             traffic.throttle(wait).await;
         }
+    }
+}
+
+/// Ciphers and framing state of a session that goes through a middle proxy.
+/// The cipher states are large, so everything is boxed.
+pub struct MiddleCodec {
+    pub client_dec: Box<AesCtr>,
+    pub client_enc: Box<AesCtr>,
+    pub up: Box<UpEncoder>,
+    pub down: Box<DownDecoder>,
+}
+
+fn invalid(side: ClosedBy) -> impl Fn(crate::middle::FrameError) -> (ClosedBy, io::Error) {
+    move |err| (side, err.into())
+}
+
+/// Encodes decrypted client bytes into middle-proxy frames and sends them.
+/// The frames go through a second pooled buffer: they are larger than their
+/// input, so this direction cannot be transformed in place.
+pub(crate) async fn send_to_middle(
+    upstream: &TcpStream,
+    up: &mut UpEncoder,
+    mut input: &[u8],
+) -> DirectionResult {
+    let mut out = pool::take();
+    while !input.is_empty() {
+        let (used, ready) = up
+            .encode(input, &mut out)
+            .map_err(invalid(ClosedBy::Client))?;
+        input = &input[used..];
+        write_all(upstream, &out[..ready])
+            .await
+            .map_err(on(ClosedBy::Dc))?;
+    }
+    Ok(())
+}
+
+async fn client_to_middle(
+    client: &TcpStream,
+    upstream: &TcpStream,
+    mut records: RecordReader,
+    mut dec: Box<AesCtr>,
+    mut up: Box<UpEncoder>,
+    activity: &AtomicU64,
+    traffic: &SessionTraffic<'_>,
+) -> DirectionResult {
+    loop {
+        client.readable().await.map_err(on(ClosedBy::Client))?;
+        let wait = {
+            let mut buf = pool::take();
+            let n = match client.try_read(&mut buf) {
+                Ok(0) => return Ok(()),
+                Ok(n) => n,
+                Err(err) if err.kind() == io::ErrorKind::WouldBlock => continue,
+                Err(err) => return Err((ClosedBy::Client, err)),
+            };
+            activity.fetch_add(1, Ordering::Relaxed);
+            let len = records.unwrap_in_place(&mut buf, n).map_err(|e| {
+                (
+                    ClosedBy::Client,
+                    io::Error::new(io::ErrorKind::InvalidData, e),
+                )
+            })?;
+            if len == 0 {
+                continue;
+            }
+            dec.apply(&mut buf[..len]);
+            send_to_middle(upstream, &mut up, &buf[..len]).await?;
+            traffic.account(Direction::Up, len)
+        };
+        if let Some(wait) = wait {
+            traffic.throttle(wait).await;
+        }
+    }
+}
+
+async fn middle_to_client(
+    upstream: &TcpStream,
+    client: &TcpStream,
+    mut down: Box<DownDecoder>,
+    mut enc: Box<AesCtr>,
+    activity: &AtomicU64,
+    traffic: &SessionTraffic<'_>,
+) -> DirectionResult {
+    loop {
+        upstream.readable().await.map_err(on(ClosedBy::Dc))?;
+        let wait = {
+            let mut buf = pool::take();
+            // Frames shrink into client messages, so this direction is
+            // decoded in place, behind room for the record header.
+            let (header, region) = buf.split_at_mut(RECORD_HEADER_LEN);
+            let offset = down.read_offset(region);
+            let n = match upstream.try_read(&mut region[offset..]) {
+                Ok(0) => return Ok(()),
+                Ok(n) => n,
+                Err(err) if err.kind() == io::ErrorKind::WouldBlock => continue,
+                Err(err) => return Err((ClosedBy::Dc, err)),
+            };
+            activity.fetch_add(1, Ordering::Relaxed);
+            let decoded = down
+                .decode(region, offset + n)
+                .map_err(invalid(ClosedBy::Dc))?;
+            let mut wait = None;
+            if decoded.len > 0 {
+                enc.apply(&mut region[..decoded.len]);
+                header.copy_from_slice(&record_header(decoded.len));
+                write_all(client, &buf[..RECORD_HEADER_LEN + decoded.len])
+                    .await
+                    .map_err(on(ClosedBy::Client))?;
+                wait = traffic.account(Direction::Down, RECORD_HEADER_LEN + decoded.len);
+            }
+            if decoded.closed {
+                return Ok(());
+            }
+            wait
+        };
+        if let Some(wait) = wait {
+            traffic.throttle(wait).await;
+        }
+    }
+}
+
+/// Like `relay`, for a session whose upstream is a middle proxy.
+pub async fn relay_middle(
+    client: &TcpStream,
+    upstream: &TcpStream,
+    records: RecordReader,
+    codec: MiddleCodec,
+    idle: Option<Duration>,
+    traffic: &SessionTraffic<'_>,
+) -> Ended {
+    let activity = AtomicU64::new(0);
+    let (clean, result) = tokio::select! {
+        result = client_to_middle(
+            client,
+            upstream,
+            records,
+            codec.client_dec,
+            codec.up,
+            &activity,
+            traffic,
+        ) => (ClosedBy::Client, result),
+        result = middle_to_client(
+            upstream,
+            client,
+            codec.down,
+            codec.client_enc,
+            &activity,
+            traffic,
+        ) => (ClosedBy::Dc, result),
+        () = idle_watch(&activity, idle) => (ClosedBy::Idle, Ok(())),
+    };
+    match result {
+        Ok(()) => Ended {
+            by: clean,
+            error: None,
+        },
+        Err((by, error)) => Ended {
+            by,
+            error: Some(error),
+        },
     }
 }
 
