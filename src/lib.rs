@@ -3,6 +3,7 @@ pub mod config;
 pub mod dc;
 pub mod limit;
 pub mod mask;
+pub mod middle;
 pub mod obfs2;
 pub mod pool;
 pub mod relay;
